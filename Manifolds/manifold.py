@@ -144,7 +144,3 @@ class RiemannianManifold:
 
     def interpolate(self, q: np.ndarray, p: np.ndarray, u: float) -> np.ndarray:
         return self.Exp(q, float(u) * self.Log(q, p))
-
-
-# Backwards-compatible spelling used by the first prototype.
-RiemannianManifold = RiemannianManifold
