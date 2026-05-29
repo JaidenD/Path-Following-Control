@@ -147,4 +147,4 @@ class RiemannianManifold:
 
 
 # Backwards-compatible spelling used by the first prototype.
-RiemannManifold = RiemannianManifold
+RiemannianManifold = RiemannianManifold

@@ -1,4 +1,4 @@
-from Manifolds.manifold import Euclidean, Manifold, RiemannManifold, RiemannianManifold
+from Manifolds.manifold import Euclidean, Manifold, RiemannianManifold, RiemannianManifold
 from Manifolds.joints import Prismatic, Revoloute, Revolute
 from Manifolds.product_manifold import ProductManifold
 
@@ -9,6 +9,6 @@ __all__ = [
     "ProductManifold",
     "Revoloute",
     "Revolute",
-    "RiemannManifold",
+    "RiemannianManifold",
     "RiemannianManifold",
 ]
