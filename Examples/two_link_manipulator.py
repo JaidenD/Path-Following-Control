@@ -1,8 +1,10 @@
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -11,66 +13,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from Manifolds.joints import Revolute
 from Manifolds.manifold import RiemannianManifold
 from Manifolds.product_manifold import ProductManifold
-from Numerics.closest_point import closest_point
-from decoupled_controllers import (
-    ComputedTorquePathFollowingController,
-    EtaVelocityController,
-    EtaXiTransform,
-    XiStabilizer,
-)
-from path import (
-    CubicSplinePath,
-    coordinate_circle_path,
-    coordinate_figure_eight_path,
-    coordinate_lissajous_path,
-)
-from robot_model import FullyActuatedRobotModel
+from path import CubicSplinePath, coordinate_circle_path
 
 
-# ============================================================
-# Configuration manifold: Q = S^1 x S^1
-# ============================================================
 
+# Q = S^1 x S^1
 CONFIG_MANIFOLD = ProductManifold(Revolute(), Revolute())
-Q = RiemannianManifold(CONFIG_MANIFOLD, np.eye(2))
-
-def wrap(theta):
-    """
-    Wrap angles to (-pi, pi].
-    Works for scalars or numpy arrays.
-    """
-    return (theta + np.pi) % (2.0 * np.pi) - np.pi
-
-
-def T2_exp(q, v):
-    """
-    Exp_q(v) on S^1 x S^1 with standard flat product metric.
-
-    q, v are both shape (2,).
-    """
-    return Q.Exp(q, v)
-
-
-def T2_log(q, p):
-    """
-    Log_q(p) on S^1 x S^1 with standard flat product metric.
-
-    q, p are both shape (2,).
-    Returns the wrapped displacement from q to p.
-    """
-    return Q.Log(q, p)
-
-
-def T2_dist(q, p):
-    """
-    Distance on S^1 x S^1 with standard flat product metric.
-    """
-    return Q.dist(q, p)
-
-
-# ============================================================
-# Physical parameters
-# ============================================================
 
 params = {
     "m1": 1.0,
@@ -91,7 +39,7 @@ params = {
 
 def mass_matrix(q):
     """
-    Return M(q) for a standard planar 2R manipulator.
+    Return M(q), the kinetic-energy metric for a standard planar 2R arm.
 
     q[0] = theta1
     q[1] = theta2, relative angle of link 2 wrt link 1
@@ -119,11 +67,8 @@ def mass_matrix(q):
         [M12, M22],
     ])
 
-
 def coriolis_vector(q, qdot):
-    """
-    Return C(q, qdot) qdot as a vector.
-    """
+    """Return C(q, qdot) qdot."""
     theta2 = q[1]
     dtheta1, dtheta2 = qdot
 
@@ -138,15 +83,8 @@ def coriolis_vector(q, qdot):
 
     return np.array([C1, C2])
 
-
 def gravity_vector(q):
-    """
-    Return G(q).
-
-    Convention:
-    theta1 is absolute angle of link 1.
-    theta2 is relative angle of link 2 wrt link 1.
-    """
+    """Return G(q)."""
     theta1, theta2 = q
 
     m1 = params["m1"]
@@ -163,287 +101,425 @@ def gravity_vector(q):
 
     return np.array([G1, G2])
 
-
 def forward_dynamics(q, qdot, tau):
     """
-    Solve
-
-        M(q) qddot + C(q,qdot)qdot + G(q) = tau
-
-    for qddot.
+    Solve M(q) qddot + C(q,qdot)qdot + G(q) = tau for qddot.
     """
-    M = mass_matrix(q)
-    C = coriolis_vector(q, qdot)
-    G = gravity_vector(q)
+    return np.linalg.solve(mass_matrix(q), tau - coriolis_vector(q, qdot) - gravity_vector(q))
 
-    return np.linalg.solve(M, tau - C - G)
-
+def inverse_dynamics(q, qdot, qddot_cmd):
+    """
+    Computed-torque map from desired acceleration to torque.
+    """
+    return mass_matrix(q) @ qddot_cmd + (coriolis_vector(q, qdot) + gravity_vector(q))
 
 def state_dot(state, tau):
-    """
-    State convention:
-
-        state[:, 0] = q
-        state[:, 1] = qdot
-
-    For the two-link manipulator:
-
-        state =
-        [[theta1, dtheta1],
-         [theta2, dtheta2]]
-    """
     q = state[:, 0]
     qdot = state[:, 1]
-
     qddot = forward_dynamics(q, qdot, tau)
-
     return np.column_stack((qdot, qddot))
-
 
 def wrap_state(state):
     """
-    Wrap the configuration q back onto S^1 x S^1.
-    Do not wrap qdot.
+    Wrap only the joint angles. This is topological projection, not the
+    Riemannian exponential map.
     """
-    q = state[:, 0]
+    q = CONFIG_MANIFOLD.project(state[:, 0])
     qdot = state[:, 1]
-
-    q_wrapped = T2_exp(np.zeros(2), q)
-
-    return np.column_stack((q_wrapped, qdot))
+    return np.column_stack((q, qdot))
 
 
-# ============================================================
-# Example paths gamma : [0, 1] -> S^1 x S^1
-# ============================================================
+# Metrics used in the comparison
+
+# Exact method:
+# Q_EXACT.Log(p, q) solves the geodesic boundary-value problem for M(q).
+Q_EXACT = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix)
+
+# Fast method:
+# Q_FAST.Log(p, q) uses the wrapped joint-space chart displacement, while
+# Q_FAST.inner/norm still use the kinetic-energy metric M(q).
+Q_FAST = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix, use_analytic=True)
+
+
+# Setup test paths
 
 PATH_KIND = os.environ.get("PATH_KIND", "circle")
 
 
-def make_spline_test_path():
+def make_spline_test_path(Q):
     waypoints = [
         np.array([0.0, 0.75]),
-        np.array([0.65, 0.2]),
-        np.array([0.35, -0.65]),
-        np.array([-0.45, -0.45]),
-        np.array([-0.75, 0.25]),
+        np.array([0.75, 0.0]),
+        np.array([0.0, -0.75]),
+        np.array([-0.75, 0.0]),
     ]
     return CubicSplinePath(Q, waypoints, closed=True, bc_type="periodic")
 
 
-def make_configuration_path(kind=PATH_KIND):
+def make_configuration_path(kind=PATH_KIND, Q=Q_FAST):
     if kind == "circle":
         return coordinate_circle_path(Q, radius=0.8)
-    if kind == "figure_eight":
-        return coordinate_figure_eight_path(Q, amplitudes=(0.8, 0.45))
-    if kind == "lissajous":
-        return coordinate_lissajous_path(
-            Q,
-            amplitudes=np.array([0.7, 0.5]),
-            frequencies=np.array([1.0, 2.0]),
-            phases=np.array([0.0, np.pi / 3.0]),
-        )
     if kind == "spline":
-        return make_spline_test_path()
-    raise ValueError(f"Unknown path kind {kind!r}.")
+        return make_spline_test_path(Q)
+    raise ValueError(f"Unknown path kind {kind!r}. Use 'circle' or 'spline'.")
 
 
-configuration_path = make_configuration_path(PATH_KIND)
+configuration_path = make_configuration_path(PATH_KIND, Q_FAST)
 
 
 def gamma(s):
-    """Evaluate the currently selected test path."""
     return configuration_path.eval(s)
 
 
 def gamma_prime(s):
-    """Derivative of the currently selected test path."""
     return configuration_path.derivative(s)
 
 
-def tangent_unit(s):
-    """
-    Unit tangent vector to gamma at s.
-    """
-    return configuration_path.tangent(s)
-
-
-def normal_unit(s):
-    """
-    Unit normal vector to gamma at s.
-
-    Since Q is 2D and the path is 1D, the normal space is 1D.
-    """
-    T = tangent_unit(s)
-
-    return np.array([
-        -T[1],
-        T[0],
-    ])
-
-
 # ============================================================
-# eta-xi coordinate transform
+# eta-xi coordinate transforms
 # ============================================================
 
-def displacement_from_path(s, q):
+def metric_unit_tangent(Q, path, eta):
+    p = path.eval(eta)
+    tangent = path.derivative(eta)
+    return tangent / Q.norm(p, tangent)
+
+
+def metric_unit_normal(Q, p, tangent):
     """
-    e(s, q) = Log_{gamma(s)}(q).
+    In 2D, a metric-normal vector N satisfies T^T G N = 0.
+
+    Let alpha = G T. Then alpha^T N = 0, so a Euclidean perpendicular to
+    alpha is metric-orthogonal to T.
     """
+    alpha = Q.metric(p) @ tangent
+    normal = np.array([-alpha[1], alpha[0]])
+    return normal / Q.norm(p, normal)
+
+
+def normalize_eta(s, closed=True):
+    if closed:
+        return float(s % 1.0)
+    return float(np.clip(s, 0.0, 1.0))
+
+
+def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidates=4):
+    """
+    One-dimensional closest-point search over eta.
+
+    If eta_guess is provided, search locally near the previous branch. If not,
+    do a coarse global scan first. The exact method is slow because each
+    objective call solves a geodesic BVP.
+    """
+    intervals = []
+
+    if eta_guess is not None:
+        intervals.append((eta_guess - window, eta_guess + window))
+    else:
+        grid = np.linspace(0.0, 1.0, global_grid, endpoint=False)
+        values = np.array([objective(s) for s in grid])
+        best_indices = np.argsort(values)[:candidates]
+        step = 1.0 / global_grid
+
+        for idx in best_indices:
+            center = grid[idx]
+            intervals.append((center - step, center + step))
+
+    best_eta = None
+    best_value = np.inf
+
+    for a, b in intervals:
+        result = minimize_scalar(
+            lambda s: objective(normalize_eta(s)),
+            bounds=(a, b),
+            method="bounded",
+        )
+        if result.fun < best_value:
+            best_eta = normalize_eta(result.x)
+            best_value = result.fun
+
+    return best_eta
+
+
+def closest_eta_xi_exact(q, path, eta_guess=None):
+    """
+    Exact Riemannian version:
+
+        eta = argmin_s || Log^geodesic_gamma(s)(q) ||_M^2
+        xi  = Log^geodesic_gamma(eta)(q)
+
+    This is theoretically clean but expensive because Log solves a BVP.
+    """
+    q = CONFIG_MANIFOLD.project(q)
+
+    def objective(s):
+        p = path.eval(s)
+        xi = Q_EXACT.Log(p, q)
+        return Q_EXACT.squared_norm(p, xi)
+
+    eta = minimize_eta(objective, eta_guess=eta_guess)
+    p = path.eval(eta)
+    xi = Q_EXACT.Log(p, q)
+
+    return eta, p, xi
+
+
+def closest_eta_xi_fast(q, path, eta_guess=None):
+    """
+    Fast local version:
+
+        delta = wrapped joint-space displacement from gamma(s) to q
+        eta   = argmin_s delta^T M(gamma(s)) delta
+        xi    = delta
+
+    This keeps the kinetic-energy metric in the inner product, but avoids
+    solving geodesic BVPs inside the controller.
+    """
+    q = CONFIG_MANIFOLD.project(q)
+
+    def objective(s):
+        p = path.eval(s)
+        xi = CONFIG_MANIFOLD.log(p, q)
+        return Q_FAST.squared_norm(p, xi)
+
+    eta = minimize_eta(objective, eta_guess=eta_guess)
+    p = path.eval(eta)
+    xi = CONFIG_MANIFOLD.log(p, q)
+
+    return eta, p, xi
+
+
+def displacement_from_path(s, q, method="fast"):
     p = gamma(s)
-    return Q.Log(p, q)
+    if method == "exact":
+        return Q_EXACT.Log(p, q)
+    if method == "fast":
+        return CONFIG_MANIFOLD.log(p, q)
+    raise ValueError("method must be 'exact' or 'fast'.")
 
 
-def squared_distance_to_path(s, q):
-    """
-    Squared distance from q to gamma(s).
-    """
-    p = gamma(s)
-    e = displacement_from_path(s, q)
-    return Q.squared_norm(p, e)
+def eta_xi_transform(q, eta_guess=None, method="fast"):
+    if method == "exact":
+        eta, p, xi_vec = closest_eta_xi_exact(q, configuration_path, eta_guess)
+        Q = Q_EXACT
+    elif method == "fast":
+        eta, p, xi_vec = closest_eta_xi_fast(q, configuration_path, eta_guess)
+        Q = Q_FAST
+    else:
+        raise ValueError("method must be 'exact' or 'fast'.")
 
+    tangent = metric_unit_tangent(Q, configuration_path, eta)
+    normal = metric_unit_normal(Q, p, tangent)
+    xi_scalar = Q.inner(p, xi_vec, normal)
 
-def closest_eta(q, eta_guess=None, window=0.1):
-    """
-    Find eta = argmin_s dist(gamma(s), q)^2.
+    return eta, xi_scalar
 
-    If eta_guess is None:
-        search globally on [0, 1].
-
-    If eta_guess is provided:
-        search locally around eta_guess.
-    """
-
-    result = closest_point(
-        Q,
-        q,
-        configuration_path,
-        eta_guess=eta_guess,
-        window=window,
-    )
-    return result.eta
-
-
-def eta_xi_transform(q, eta_guess=None, *, return_vector=False):
-    """
-    Compute q -> (eta, xi) for q in S^1 x S^1.
-
-    eta:
-        closest path parameter
-
-    xi:
-        scalar transverse displacement in the normal direction
-    """
-    result = closest_point(Q, q, configuration_path, eta_guess=eta_guess)
-
-    if return_vector:
-        return result.eta, result.xi
-
-    N = normal_unit(result.eta)
-    xi = N @ result.xi
-
-    return result.eta, xi
-def estimate_path_tube_radius():
-    """
-    Rough visualization radius for the normal tube.
-
-    For the default circle this is the true focal radius. For the other test
-    paths it is only a conservative plotting radius.
-    """
-    exp_inj_radius = np.pi
-    path_focal_radius = 0.8 if PATH_KIND == "circle" else 0.3
-
-    return min(exp_inj_radius, path_focal_radius)
-
-
-def tube_boundary_points(epsilon, n=600):
-    """
-    Build boundary curves of the normal tube around gamma.
-
-    Returns:
-        upper_boundary, lower_boundary
-
-    where
-        upper = gamma(s) + epsilon N(s)
-        lower = gamma(s) - epsilon N(s)
-    """
-    s_grid = np.linspace(0.0, 1.0, n)
-
-    upper = []
-    lower = []
-
-    for s in s_grid:
-        p = gamma(s)
-        N = normal_unit(s)
-
-        upper.append(T2_exp(p, epsilon * N))
-        lower.append(T2_exp(p, -epsilon * N))
-
-    return np.array(upper), np.array(lower)
 
 # ============================================================
-# Path-following controller
+# Path-following controllers
 # ============================================================
 
 controller_params = {
-    "v_eta": 0.25,   # desired speed along the path direction
-    "k_xi": 4.0,     # transverse correction gain
-    "k_d": 6.0,      # velocity damping gain
+    "path_speed": 0.25,
+    "eta_velocity_gain": 8.0,
+    "xi_position_gain": 16.0,
+    "xi_velocity_gain": 8.0,
 }
 
 
-two_link_robot = FullyActuatedRobotModel(
-    dim=2,
-    mass_matrix_fn=mass_matrix,
-    bias_fn=lambda q, qdot: coriolis_vector(q, qdot) + gravity_vector(q),
-    manifold=CONFIG_MANIFOLD,
-)
+def closest_path_coordinates(q, path, eta_guess, method):
+    if method == "exact":
+        Q = Q_EXACT
+        eta, p, xi_vec = closest_eta_xi_exact(q, path, eta_guess)
+    elif method == "fast":
+        Q = Q_FAST
+        eta, p, xi_vec = closest_eta_xi_fast(q, path, eta_guess)
+    else:
+        raise ValueError("method must be 'exact' or 'fast'.")
 
-path_controller = ComputedTorquePathFollowingController(
-    Q,
-    configuration_path,
-    two_link_robot,
-    eta_controller=EtaVelocityController(speed=controller_params["v_eta"]),
-    xi_controller=XiStabilizer(gain=controller_params["k_xi"]),
-    damping_gain=controller_params["k_d"],
-    transform=EtaXiTransform(Q, configuration_path, window=0.1),
-)
+    tangent = metric_unit_tangent(Q, path, eta)
+    normal = metric_unit_normal(Q, p, tangent)
+    xi_scalar = Q.inner(p, xi_vec, normal)
+
+    return Q, eta, p, tangent, normal, xi_scalar
+
+
+def tubular_point(path, Q, eta, xi, method):
+    """
+    Local path chart used by the controller:
+
+        q = Phi(eta, xi) = Exp_gamma(eta)(xi N(eta)).
+
+    For the fast method, Exp is the wrapped joint-space chart exponential. For
+    the exact method, Exp is the numerical geodesic IVP for the kinetic-energy
+    metric, so it is intentionally much slower.
+    """
+    p = path.eval(eta)
+    tangent = metric_unit_tangent(Q, path, eta)
+    normal = metric_unit_normal(Q, p, tangent)
+    displacement = float(xi) * normal
+
+    if method == "exact":
+        return Q.Exp(p, displacement)
+    if method == "fast":
+        return CONFIG_MANIFOLD.exp(p, displacement)
+    raise ValueError("method must be 'exact' or 'fast'.")
+
+
+def tubular_jacobian(path, Q, eta, xi, method, eps_eta=1e-5, eps_xi=1e-5):
+    """
+    Numerically compute D Phi(eta, xi).
+
+    The columns map [eta_dot, xi_dot] to qdot. Differences are taken with the
+    wrapped manifold logarithm so revolute joints use the local branch.
+    """
+    q0 = tubular_point(path, Q, eta, xi, method)
+
+    q_eta_plus = tubular_point(path, Q, eta + eps_eta, xi, method)
+    q_eta_minus = tubular_point(path, Q, eta - eps_eta, xi, method)
+    d_eta = (
+        CONFIG_MANIFOLD.log(q0, q_eta_plus)
+        - CONFIG_MANIFOLD.log(q0, q_eta_minus)
+    ) / (2.0 * eps_eta)
+
+    q_xi_plus = tubular_point(path, Q, eta, xi + eps_xi, method)
+    q_xi_minus = tubular_point(path, Q, eta, xi - eps_xi, method)
+    d_xi = (
+        CONFIG_MANIFOLD.log(q0, q_xi_plus)
+        - CONFIG_MANIFOLD.log(q0, q_xi_minus)
+    ) / (2.0 * eps_xi)
+
+    return np.column_stack((d_eta, d_xi))
+
+
+def solve_output_velocity(J, qdot):
+    """
+    Recover [eta_dot, xi_dot] from qdot = D Phi(eta, xi) ydot.
+    """
+    try:
+        return np.linalg.solve(J, qdot)
+    except np.linalg.LinAlgError:
+        ydot, *_ = np.linalg.lstsq(J, qdot, rcond=None)
+        return ydot
+
+
+def jacobian_dot_times_output_velocity(path, Q, eta, xi, ydot, method):
+    """
+    Directional derivative (d/dt D Phi) ydot.
+
+    This is the centripetal/path-curvature term missing from the previous
+    velocity-field controller. It is evaluated numerically to keep the example
+    close to the math without deriving a long expression for every path type.
+    """
+    if np.linalg.norm(ydot) < 1e-12:
+        return np.zeros(Q.dim)
+
+    eps_time = 1e-4
+    eta_plus = eta + eps_time * ydot[0]
+    xi_plus = xi + eps_time * ydot[1]
+    eta_minus = eta - eps_time * ydot[0]
+    xi_minus = xi - eps_time * ydot[1]
+
+    J_plus = tubular_jacobian(path, Q, eta_plus, xi_plus, method)
+    J_minus = tubular_jacobian(path, Q, eta_minus, xi_minus, method)
+
+    Jdot = (J_plus - J_minus) / (2.0 * eps_time)
+    return Jdot @ ydot
+
+
+def desired_eta_rate(Q, path, eta):
+    """
+    Convert the desired metric speed along the path to eta_dot.
+
+    Since eta parameterizes the curve on [0, 1], gamma'(eta) is not generally
+    unit speed. The scalar eta_dot below makes ||gamma'(eta) eta_dot||_M equal
+    controller_params["path_speed"].
+    """
+    p = path.eval(eta)
+    gamma_eta = path.derivative(eta)
+    path_parameter_speed = Q.norm(p, gamma_eta)
+    return controller_params["path_speed"] / max(path_parameter_speed, 1e-9)
+
+
+def desired_eta_acceleration(Q, path, eta):
+    """
+    Feedforward eta_ddot for a constant metric-speed reference.
+    """
+    h = 1e-5
+    rate_plus = desired_eta_rate(Q, path, eta + h)
+    rate_minus = desired_eta_rate(Q, path, eta - h)
+    d_rate_d_eta = (rate_plus - rate_minus) / (2.0 * h)
+    rate = desired_eta_rate(Q, path, eta)
+    return d_rate_d_eta * rate
+
+
+def computed_torque_path_controller(state, path, eta_guess, method):
+    """
+    Transverse feedback linearization in local path coordinates.
+
+    Let y = [eta, xi] and q = Phi(y). The code computes
+
+        qdot  = D Phi(y) ydot
+        qddot = D Phi(y) yddot + d/dt(D Phi(y)) ydot
+
+    and chooses yddot so eta tracks a path-speed reference while xi is a
+    damped second-order transverse coordinate. The final computed-torque step
+    handles the manipulator dynamics M(q)qddot + C(q,qdot)qdot + G(q).
+    """
+    q = CONFIG_MANIFOLD.project(state[:, 0])
+    qdot = state[:, 1]
+
+    Q, eta, _, _, _, xi = closest_path_coordinates(
+        q,
+        path,
+        eta_guess,
+        method,
+    )
+
+    J = tubular_jacobian(path, Q, eta, xi, method)
+    eta_dot, xi_dot = solve_output_velocity(J, qdot)
+
+    eta_dot_ref = desired_eta_rate(Q, path, eta)
+    eta_ddot_ref = desired_eta_acceleration(Q, path, eta)
+    eta_ddot_cmd = eta_ddot_ref + controller_params["eta_velocity_gain"] * (
+        eta_dot_ref - eta_dot
+    )
+
+    xi_ddot_cmd = (
+        -controller_params["xi_position_gain"] * xi
+        -controller_params["xi_velocity_gain"] * xi_dot
+    )
+
+    ydot = np.array([eta_dot, xi_dot])
+    yddot_cmd = np.array([eta_ddot_cmd, xi_ddot_cmd])
+
+    qddot_feedforward = jacobian_dot_times_output_velocity(
+        path,
+        Q,
+        eta,
+        xi,
+        ydot,
+        method,
+    )
+    qddot_cmd = J @ yddot_cmd + qddot_feedforward
+    tau = inverse_dynamics(q, qdot, qddot_cmd)
+
+    return tau, eta, xi
+
+
+def path_following_controller_exact(state, eta_guess=None, path=configuration_path):
+    return computed_torque_path_controller(state, path, eta_guess, method="exact")
+
+
+def path_following_controller_fast(state, eta_guess=None, path=configuration_path):
+    return computed_torque_path_controller(state, path, eta_guess, method="fast")
 
 
 def path_following_controller(state, eta_guess=None):
     """
-    Simple path-following controller for the 2-link manipulator.
-
-    Coordinate transform:
-
-        q -> (eta, xi)
-
-    Desired velocity field:
-
-        qdot_des = v_eta T(eta) - k_xi xi N(eta)
-
-    Computed torque form:
-
-        tau = M(q) qddot_cmd + C(q,qdot)qdot + G(q)
-
-    where
-
-        qddot_cmd = -k_d (qdot - qdot_des)
-
-    Inputs:
-        state[:, 0] = q
-        state[:, 1] = qdot
-
-    Returns:
-        tau, eta, xi
+    Backwards-compatible default used by tests and quick experiments.
     """
-    q = state[:, 0]
-    qdot = state[:, 1]
-
-    output = path_controller.command(q, qdot, eta_guess=eta_guess)
-    xi_scalar = normal_unit(output.eta) @ output.xi
-
-    return output.u, output.eta, xi_scalar
+    return path_following_controller_fast(state, eta_guess=eta_guess)
 
 
 # ============================================================
@@ -451,20 +527,11 @@ def path_following_controller(state, eta_guess=None):
 # ============================================================
 
 def euler_step(state, tau, dt):
-    """
-    One explicit Euler step.
-    """
     next_state = state + dt * state_dot(state, tau)
     return wrap_state(next_state)
 
 
 def rk4_step(state, tau_func, dt):
-    """
-    One RK4 step.
-
-    tau_func takes state and returns tau.
-    """
-
     def f(x):
         tau = tau_func(x)
         return state_dot(x, tau)
@@ -479,15 +546,18 @@ def rk4_step(state, tau_func, dt):
     return wrap_state(next_state)
 
 
-def simulate_path_following(state0, dt=0.001, T_final=5.0, use_rk4=True):
+def simulate_path_following(
+    state0,
+    dt=0.005,
+    T_final=0.05,
+    use_rk4=False,
+    method="fast",
+    path=configuration_path,
+):
     """
-    Simulate closed-loop path following.
-
-    Returns a dictionary containing histories of:
-        t, q, qdot, eta, xi, tau
+    Simulate closed-loop path following and record wall-clock time per step.
     """
     n_steps = int(T_final / dt)
-
     state = state0.copy()
     eta_guess = None
 
@@ -498,12 +568,19 @@ def simulate_path_following(state0, dt=0.001, T_final=5.0, use_rk4=True):
         "eta": [],
         "xi": [],
         "tau": [],
+        "step_time": [],
     }
 
     for k in range(n_steps):
+        step_start = time.perf_counter()
         t = k * dt
 
-        tau, eta, xi = path_following_controller(state, eta_guess=eta_guess)
+        tau, eta, xi = computed_torque_path_controller(
+            state,
+            path,
+            eta_guess,
+            method=method,
+        )
         eta_guess = eta
 
         history["t"].append(t)
@@ -515,12 +592,19 @@ def simulate_path_following(state0, dt=0.001, T_final=5.0, use_rk4=True):
 
         if use_rk4:
             def tau_func(x):
-                tau_x, _, _ = path_following_controller(x, eta_guess=eta_guess)
+                tau_x, _, _ = computed_torque_path_controller(
+                    x,
+                    path,
+                    eta_guess,
+                    method=method,
+                )
                 return tau_x
 
             state = rk4_step(state, tau_func, dt)
         else:
             state = euler_step(state, tau, dt)
+
+        history["step_time"].append(time.perf_counter() - step_start)
 
     for key in history:
         history[key] = np.array(history[key])
@@ -528,250 +612,205 @@ def simulate_path_following(state0, dt=0.001, T_final=5.0, use_rk4=True):
     return history
 
 
+def timing_summary(name, history):
+    step_time = history["step_time"]
+    if len(step_time) == 0:
+        print(f"{name}: no steps")
+        return
+
+    print(f"\n{name}")
+    print(f"  steps:          {len(step_time)}")
+    print(f"  total walltime: {np.sum(step_time):.6f} s")
+    print(f"  first step:     {step_time[0]:.6f} s")
+    print(f"  mean step:      {np.mean(step_time):.6f} s")
+    print(f"  median step:    {np.median(step_time):.6f} s")
+    print(f"  min step:       {np.min(step_time):.6f} s")
+    print(f"  max step:       {np.max(step_time):.6f} s")
+    if len(step_time) > 1:
+        print(f"  mean after 1st: {np.mean(step_time[1:]):.6f} s")
+
+def plot_single_summary(history, path, title):
+    import matplotlib.pyplot as plt
+
+    t = history["t"]
+    q_hist = history["q"]
+    qdot_hist = history["qdot"]
+    eta_hist = history["eta"]
+    xi_hist = history["xi"]
+    tau_hist = history["tau"]
+    step_time = history["step_time"]
+
+    path_grid = np.linspace(0.0, 1.0, 400)
+    path_points = np.array([path.eval(s) for s in path_grid])
+
+    fig, axs = plt.subplots(3, 2, figsize=(14, 12))
+
+    axs[0, 0].plot(path_points[:, 0], path_points[:, 1], label="path")
+    axs[0, 0].plot(q_hist[:, 0], q_hist[:, 1], label="q(t)")
+    axs[0, 0].scatter(q_hist[0, 0], q_hist[0, 1], marker="o", label="start")
+    axs[0, 0].scatter(q_hist[-1, 0], q_hist[-1, 1], marker="x", label="end")
+    axs[0, 0].axis("equal")
+    axs[0, 0].grid(True)
+    axs[0, 0].legend()
+    axs[0, 0].set_title("Configuration-space path")
+
+    axs[0, 1].plot(t, q_hist[:, 0], label="theta1")
+    axs[0, 1].plot(t, q_hist[:, 1], label="theta2")
+    axs[0, 1].grid(True)
+    axs[0, 1].legend()
+    axs[0, 1].set_title("Joint angles")
+
+    axs[1, 0].plot(t, qdot_hist[:, 0], label="theta1_dot")
+    axs[1, 0].plot(t, qdot_hist[:, 1], label="theta2_dot")
+    axs[1, 0].grid(True)
+    axs[1, 0].legend()
+    axs[1, 0].set_title("Joint velocities")
+
+    axs[1, 1].plot(t, eta_hist, label="eta")
+    axs[1, 1].plot(t, xi_hist, label="xi")
+    axs[1, 1].grid(True)
+    axs[1, 1].legend()
+    axs[1, 1].set_title("Path coordinates")
+
+    axs[2, 0].plot(t, step_time)
+    axs[2, 0].grid(True)
+    axs[2, 0].set_title("Wall-clock time per step")
+    axs[2, 0].set_xlabel("simulation time [s]")
+    axs[2, 0].set_ylabel("wall time [s]")
+
+    axs[2, 1].plot(t, tau_hist[:, 0], label="tau1")
+    axs[2, 1].plot(t, tau_hist[:, 1], label="tau2")
+    axs[2, 1].grid(True)
+    axs[2, 1].legend()
+    axs[2, 1].set_title("Control torques")
+
+    fig.suptitle(title, fontsize=16)
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_comparison(exact_hist, fast_hist, path):
+    import matplotlib.pyplot as plt
+
+    path_grid = np.linspace(0.0, 1.0, 400)
+    path_points = np.array([path.eval(s) for s in path_grid])
+
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+
+    axs[0, 0].plot(path_points[:, 0], path_points[:, 1], label="path")
+    axs[0, 0].plot(exact_hist["q"][:, 0], exact_hist["q"][:, 1], label="exact")
+    axs[0, 0].plot(fast_hist["q"][:, 0], fast_hist["q"][:, 1], label="fast")
+    axs[0, 0].axis("equal")
+    axs[0, 0].grid(True)
+    axs[0, 0].legend()
+    axs[0, 0].set_title("Configuration-space trajectory")
+
+    axs[0, 1].plot(exact_hist["t"], exact_hist["xi"], label="exact")
+    axs[0, 1].plot(fast_hist["t"], fast_hist["xi"], label="fast")
+    axs[0, 1].grid(True)
+    axs[0, 1].legend()
+    axs[0, 1].set_title("Transverse coordinate xi")
+
+    axs[1, 0].plot(exact_hist["t"], exact_hist["step_time"], label="exact")
+    axs[1, 0].plot(fast_hist["t"], fast_hist["step_time"], label="fast")
+    axs[1, 0].grid(True)
+    axs[1, 0].legend()
+    axs[1, 0].set_title("Wall-clock time per simulation step")
+
+    axs[1, 1].plot(exact_hist["t"], exact_hist["eta"], label="exact")
+    axs[1, 1].plot(fast_hist["t"], fast_hist["eta"], label="fast")
+    axs[1, 1].grid(True)
+    axs[1, 1].legend()
+    axs[1, 1].set_title("Path coordinate eta")
+
+    fig.tight_layout()
+    plt.show()
+
+
+def compare_exact_and_fast(
+    state0,
+    dt=0.005,
+    T_final=0.025,
+    use_rk4=False,
+    path=configuration_path,
+):
+    """
+    Run the exact geodesic controller and fast local controller on the same
+    two-link arm and print per-step timing statistics.
+    """
+    print("Running exact geodesic-BVP metric simulation...")
+    exact = simulate_path_following(
+        state0,
+        dt=dt,
+        T_final=T_final,
+        use_rk4=use_rk4,
+        method="exact",
+        path=path,
+    )
+
+    print("Running fast local metric simulation...")
+    fast = simulate_path_following(
+        state0,
+        dt=dt,
+        T_final=T_final,
+        use_rk4=use_rk4,
+        method="fast",
+        path=path,
+    )
+
+    timing_summary("Exact geodesic BVP metric", exact)
+    timing_summary("Fast local metric", fast)
+
+    if len(exact["step_time"]) and len(fast["step_time"]):
+        ratio = np.mean(exact["step_time"]) / np.mean(fast["step_time"])
+        print(f"\nMean-step speedup: {ratio:.1f}x")
+
+    return exact, fast
+
+
 # ============================================================
 # Example usage
 # ============================================================
 
 if __name__ == "__main__":
-    # --------------------------------------------------------
-    # Basic dynamics test
-    # --------------------------------------------------------
-
-    q = np.zeros(2)
-    qdot = np.zeros(2)
-
-    state = np.column_stack((q, qdot))
-
-    tau = np.zeros(2)
-
-    xdot = state_dot(state, tau)
-
-    print("state =")
-    print(state)
-
-    print("\nxdot =")
-    print(xdot)
-
-    print("\nM(q) =")
-    print(mass_matrix(q))
-
-    print("\nC(q,qdot)qdot =")
-    print(coriolis_vector(q, qdot))
-
-    print("\nG(q) =")
-    print(gravity_vector(q))
-
-    # --------------------------------------------------------
-    # Test S1 x S1 geometry
-    # --------------------------------------------------------
-
-    p = np.array([np.pi / 2, -np.pi / 2])
-    v = T2_log(q, p)
-
-    print("\nT2_log(q, p) =")
-    print(v)
-
-    print("\nT2_exp(q, T2_log(q,p)) =")
-    print(T2_exp(q, v))
-
-    print("\nT2_dist(q, p) =")
-    print(T2_dist(q, p))
-
-    # --------------------------------------------------------
-    # Test eta-xi coordinates
-    # --------------------------------------------------------
-
-    q_test = np.array([0.2, 0.7])
-
-    eta, xi = eta_xi_transform(q_test)
-
-    print("\nq_test =")
-    print(q_test)
-
-    print("\neta =")
-    print(eta)
-
-    print("\nxi =")
-    print(xi)
-
-    print("\ngamma(eta) =")
-    print(gamma(eta))
-
-    print("\nLog_gamma(eta)(q_test) =")
-    print(displacement_from_path(eta, q_test))
-
-    # --------------------------------------------------------
-    # Test controller
-    # --------------------------------------------------------
-
-    q0 = np.array([0.2, 0.7])
+    q0 = np.array([1.0, 1.0])
     qdot0 = np.array([0.0, 0.0])
     state0 = np.column_stack((q0, qdot0))
 
-    tau0, eta0, xi0 = path_following_controller(state0)
+    dt = float(os.environ.get("DT", "0.005"))
+    T_final = float(os.environ.get("T_FINAL", "0.025"))
+    use_rk4 = os.environ.get("USE_RK4", "0") == "1"
+    sim_mode = os.environ.get("SIM_MODE", "compare")
+    show_plot = os.environ.get("SHOW_PLOT", "0") == "1"
 
-    print("\nController test")
-    print("tau0 =")
-    print(tau0)
+    print(f"PATH_KIND = {PATH_KIND}")
+    print(f"SIM_MODE = {sim_mode}")
+    print(f"dt = {dt}")
+    print(f"T_final = {T_final}")
+    print(f"use_rk4 = {use_rk4}")
 
-    print("\neta0 =")
-    print(eta0)
-
-    print("\nxi0 =")
-    print(xi0)
-
-    # --------------------------------------------------------
-    # Simulate closed-loop path following
-    # --------------------------------------------------------
-
-    hist = simulate_path_following(
-        state0,
-        dt=0.001,
-        T_final=5.0,
-        use_rk4=True,
-    )
-
-    print("\nSimulation complete.")
-
-    print("\nFinal q =")
-    print(hist["q"][-1])
-
-    print("\nFinal qdot =")
-    print(hist["qdot"][-1])
-
-    print("\nFinal eta =")
-    print(hist["eta"][-1])
-
-    print("\nFinal xi =")
-    print(hist["xi"][-1])
-
-    print("\nFinal tau =")
-    print(hist["tau"][-1])
-
-    # --------------------------------------------------------
-    # One large summary plot
-    # --------------------------------------------------------
-
-    import matplotlib.pyplot as plt
-
-    t = hist["t"]
-    q_hist = hist["q"]
-    qdot_hist = hist["qdot"]
-    eta_hist = hist["eta"]
-    xi_hist = hist["xi"]
-    tau_hist = hist["tau"]
-
-    gamma_hist = np.array([gamma(eta) for eta in eta_hist])
-
-    e_hist = np.array([
-        T2_log(gamma_hist[k], q_hist[k])
-        for k in range(len(t))
-    ])
-    e_norm = np.linalg.norm(e_hist, axis=1)
-
-    s_grid = np.linspace(0.0, 1.0, 400)
-    path_points = np.array([gamma(s) for s in s_grid])
-
-    fig, axs = plt.subplots(3, 2, figsize=(14, 12))
-
-    # --------------------------------------------------------
-    # 1. Path in configuration space
-    # --------------------------------------------------------
-
-    tube_radius = estimate_path_tube_radius()
-    tube_radius_plot = 0.95 * tube_radius
-
-    tube_upper, tube_lower = tube_boundary_points(tube_radius_plot)
-
-    # Build a closed polygon for the tube region
-    tube_polygon = np.vstack([
-        tube_upper,
-        tube_lower[::-1],
-        tube_upper[0:1],
-    ])
-
-    axs[0, 0].fill(
-        tube_polygon[:, 0],
-        tube_polygon[:, 1],
-        alpha=0.2,
-        color="tab:blue",
-        label=rf"normal tube, $\varepsilon \approx {tube_radius_plot:.2f}$",
-    )
-
-    axs[0, 0].plot(path_points[:, 0], path_points[:, 1], label=r"$\gamma(s)$")
-    axs[0, 0].plot(q_hist[:, 0], q_hist[:, 1], label=r"$q(t)$")
-    axs[0, 0].scatter(q_hist[0, 0], q_hist[0, 1], marker="o", label="start")
-    axs[0, 0].scatter(q_hist[-1, 0], q_hist[-1, 1], marker="x", label="end")
-
-    axs[0, 0].set_xlabel(r"$\theta_1$")
-    axs[0, 0].set_ylabel(r"$\theta_2$")
-    axs[0, 0].set_title(
-        rf"Path following on $S^1 \times S^1$; "
-        rf"$\mathrm{{inj}}(\exp)=\pi$, tube radius $\approx {tube_radius:.2f}$"
-    )
-    axs[0, 0].axis("equal")
-    axs[0, 0].grid(True)
-    axs[0, 0].legend()
-
-    # --------------------------------------------------------
-    # 2. Joint angles
-    # --------------------------------------------------------
-
-    axs[0, 1].plot(t, q_hist[:, 0], label=r"$\theta_1$")
-    axs[0, 1].plot(t, q_hist[:, 1], label=r"$\theta_2$")
-    axs[0, 1].set_xlabel("time [s]")
-    axs[0, 1].set_ylabel("angle [rad]")
-    axs[0, 1].set_title("Joint angles")
-    axs[0, 1].grid(True)
-    axs[0, 1].legend()
-
-    # --------------------------------------------------------
-    # 3. Joint velocities
-    # --------------------------------------------------------
-
-    axs[1, 0].plot(t, qdot_hist[:, 0], label=r"$\dot{\theta}_1$")
-    axs[1, 0].plot(t, qdot_hist[:, 1], label=r"$\dot{\theta}_2$")
-    axs[1, 0].set_xlabel("time [s]")
-    axs[1, 0].set_ylabel("velocity [rad/s]")
-    axs[1, 0].set_title("Joint velocities")
-    axs[1, 0].grid(True)
-    axs[1, 0].legend()
-
-    # --------------------------------------------------------
-    # 4. eta and xi
-    # --------------------------------------------------------
-
-    axs[1, 1].plot(t, eta_hist, label=r"$\eta$")
-    axs[1, 1].plot(t, xi_hist, label=r"$\xi$")
-    axs[1, 1].set_xlabel("time [s]")
-    axs[1, 1].set_ylabel("coordinate value")
-    axs[1, 1].set_title(r"Path coordinates $(\eta,\xi)$")
-    axs[1, 1].grid(True)
-    axs[1, 1].legend()
-
-    # --------------------------------------------------------
-    # 5. Distance to path
-    # --------------------------------------------------------
-
-    axs[2, 0].plot(t, e_norm)
-    axs[2, 0].set_xlabel("time [s]")
-    axs[2, 0].set_ylabel(r"$\|\log_{\gamma(\eta)}(q)\|$")
-    axs[2, 0].set_title("Distance to path")
-    axs[2, 0].grid(True)
-
-    # --------------------------------------------------------
-    # 6. Control torques
-    # --------------------------------------------------------
-
-    axs[2, 1].plot(t, tau_hist[:, 0], label=r"$\tau_1$")
-    axs[2, 1].plot(t, tau_hist[:, 1], label=r"$\tau_2$")
-    axs[2, 1].set_xlabel("time [s]")
-    axs[2, 1].set_ylabel("torque")
-    axs[2, 1].set_title("Control torques")
-    axs[2, 1].grid(True)
-    axs[2, 1].legend()
-
-    fig.suptitle("Two-Link Manipulator Path Following Summary", fontsize=16)
-    fig.tight_layout()
-
-    plt.show()
+    if sim_mode == "compare":
+        exact_hist, fast_hist = compare_exact_and_fast(
+            state0,
+            dt=dt,
+            T_final=T_final,
+            use_rk4=use_rk4,
+            path=configuration_path,
+        )
+        if show_plot:
+            plot_comparison(exact_hist, fast_hist, configuration_path)
+    elif sim_mode in ("fast", "exact"):
+        print(f"Running {sim_mode} simulation...")
+        hist = simulate_path_following(
+            state0,
+            dt=dt,
+            T_final=T_final,
+            use_rk4=use_rk4,
+            method=sim_mode,
+            path=configuration_path,
+        )
+        timing_summary(f"{sim_mode} simulation", hist)
+        if show_plot:
+            plot_single_summary(hist, configuration_path, f"{sim_mode} simulation")
+    else:
+        raise ValueError("SIM_MODE must be 'compare', 'fast', or 'exact'.")

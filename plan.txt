@@ -8,7 +8,7 @@ Implemented structure:
    - Path: piecewise geodesic waypoints.
    - CubicSplinePath: smooth coordinate cubic spline through waypoints, projected back onto Q.
    - ParametricPath: user-supplied gamma(s), with optional gamma_prime(s).
-   - Fixed test factories: coordinate_circle_path, coordinate_figure_eight_path, coordinate_lissajous_path.
+   - Fixed test factory: coordinate_circle_path.
 
 3. Transform q -> (eta, xi).
    - eta is the closest path parameter under ||Log_gamma(eta)(q)||_G.

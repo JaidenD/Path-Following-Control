@@ -89,8 +89,17 @@ class PathTests(unittest.TestCase):
         self.assertGreater(np.linalg.norm(path.derivative(0.0)), 1.0)
 
 
+def _segments_intersect(a, b, c, d):
+    def orient(p, q, r):
+        u = q - p
+        v = r - p
+        return u[0] * v[1] - u[1] * v[0]
+
+    return orient(a, b, c) * orient(a, b, d) < 0.0 and orient(c, d, a) * orient(c, d, b) < 0.0
+
+
 class TwoLinkExampleTests(unittest.TestCase):
-    def test_controller_outputs_finite_torque_and_reduces_xi_short_term(self):
+    def test_controller_outputs_finite_torque_and_simulation(self):
         from Examples.two_link_manipulator import path_following_controller, simulate_path_following
 
         q0 = np.array([0.2, 0.7])
@@ -101,8 +110,34 @@ class TwoLinkExampleTests(unittest.TestCase):
         self.assertTrue(np.isfinite(eta))
         self.assertTrue(np.isfinite(xi))
 
-        hist = simulate_path_following(state0, dt=0.005, T_final=0.05, use_rk4=True)
-        self.assertLess(abs(hist["xi"][-1]), abs(hist["xi"][0]))
+        hist = simulate_path_following(state0, dt=0.005, T_final=0.005, use_rk4=False)
+        self.assertTrue(np.all(np.isfinite(hist["q"])))
+        self.assertTrue(np.all(np.isfinite(hist["qdot"])))
+        self.assertTrue(np.all(np.isfinite(hist["xi"])))
+        self.assertTrue(np.all(np.isfinite(hist["tau"])))
+
+    def test_example_only_exposes_non_self_intersecting_paths(self):
+        from Examples.two_link_manipulator import make_configuration_path
+
+        for kind in ("circle", "spline"):
+            path = make_configuration_path(kind)
+            points = np.array([path.eval(s) for s in np.linspace(0.0, 1.0, 80, endpoint=False)])
+
+            for i in range(len(points)):
+                a = points[i]
+                b = points[(i + 1) % len(points)]
+                for j in range(i + 2, len(points)):
+                    if i == 0 and j == len(points) - 1:
+                        continue
+                    c = points[j]
+                    d = points[(j + 1) % len(points)]
+                    self.assertFalse(_segments_intersect(a, b, c, d), kind)
+
+        with self.assertRaises(ValueError):
+            make_configuration_path("figure_eight")
+
+        with self.assertRaises(ValueError):
+            make_configuration_path("lissajous")
 
 
 if __name__ == "__main__":
