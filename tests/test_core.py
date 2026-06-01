@@ -100,7 +100,14 @@ def _segments_intersect(a, b, c, d):
 
 class TwoLinkExampleTests(unittest.TestCase):
     def test_controller_outputs_finite_torque_and_simulation(self):
-        from Examples.two_link_manipulator import path_following_controller, simulate_path_following
+        from Examples.two_link_manipulator import (
+            closest_eta_xi_fast,
+            closest_eta_xi_lie,
+            configuration_path,
+            path_following_controller,
+            path_following_controller_lie,
+            simulate_path_following,
+        )
 
         q0 = np.array([0.2, 0.7])
         state0 = np.column_stack((q0, np.zeros(2)))
@@ -110,11 +117,33 @@ class TwoLinkExampleTests(unittest.TestCase):
         self.assertTrue(np.isfinite(eta))
         self.assertTrue(np.isfinite(xi))
 
+        tau_lie, eta_lie, xi_lie = path_following_controller_lie(state0)
+        self.assertTrue(np.all(np.isfinite(tau_lie)))
+        self.assertTrue(np.isfinite(eta_lie))
+        self.assertTrue(np.isfinite(xi_lie))
+
+        eta_fast, p_fast, xi_fast = closest_eta_xi_fast(q0, configuration_path)
+        eta_lie_raw, p_lie, xi_lie_raw = closest_eta_xi_lie(q0, configuration_path)
+        self.assertAlmostEqual(eta_fast, eta_lie_raw, places=12)
+        np.testing.assert_allclose(p_fast, p_lie, atol=1e-12)
+        np.testing.assert_allclose(xi_fast, xi_lie_raw, atol=1e-12)
+
         hist = simulate_path_following(state0, dt=0.005, T_final=0.005, use_rk4=False)
         self.assertTrue(np.all(np.isfinite(hist["q"])))
         self.assertTrue(np.all(np.isfinite(hist["qdot"])))
         self.assertTrue(np.all(np.isfinite(hist["xi"])))
         self.assertTrue(np.all(np.isfinite(hist["tau"])))
+
+        lie_hist = simulate_path_following(
+            state0,
+            dt=0.005,
+            T_final=0.005,
+            use_rk4=False,
+            method="lie",
+        )
+        np.testing.assert_allclose(hist["q"], lie_hist["q"], atol=1e-12)
+        np.testing.assert_allclose(hist["eta"], lie_hist["eta"], atol=1e-12)
+        np.testing.assert_allclose(hist["xi"], lie_hist["xi"], atol=1e-12)
 
     def test_example_only_exposes_non_self_intersecting_paths(self):
         from Examples.two_link_manipulator import make_configuration_path

@@ -140,7 +140,6 @@ Q_EXACT = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix)
 # Q_FAST.inner/norm still use the kinetic-energy metric M(q).
 Q_FAST = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix, use_analytic=True)
 
-
 # Setup test paths
 
 PATH_KIND = os.environ.get("PATH_KIND", "circle")
@@ -167,9 +166,9 @@ def make_configuration_path(kind=PATH_KIND, Q=Q_FAST):
 configuration_path = make_configuration_path(PATH_KIND, Q_FAST)
 
 
+# Set up frame
 def gamma(s):
     return configuration_path.eval(s)
-
 
 def gamma_prime(s):
     return configuration_path.derivative(s)
@@ -179,18 +178,21 @@ def gamma_prime(s):
 # eta-xi coordinate transforms
 # ============================================================
 
-def metric_unit_tangent(Q, path, eta):
+def unit_tangent(Q, path, eta):
+    """
+    Returns normalized tangent vector
+    """
     p = path.eval(eta)
     tangent = path.derivative(eta)
     return tangent / Q.norm(p, tangent)
 
 
-def metric_unit_normal(Q, p, tangent):
+def unit_normal(Q, p, tangent):
     """
-    In 2D, a metric-normal vector N satisfies T^T G N = 0.
+    For 2D, the normal vecotr N satisfies T^T @ G @ N = 0
 
-    Let alpha = G T. Then alpha^T N = 0, so a Euclidean perpendicular to
-    alpha is metric-orthogonal to T.
+    Set alpha = G @ T, then alpha^T @ N = 0, 
+    so the N is perpendicular to alpha in the Euclidean norm 
     """
     alpha = Q.metric(p) @ tangent
     normal = np.array([-alpha[1], alpha[0]])
@@ -207,17 +209,21 @@ def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidat
     """
     One-dimensional closest-point search over eta.
 
-    If eta_guess is provided, search locally near the previous branch. If not,
-    do a coarse global scan first. The exact method is slow because each
-    objective call solves a geodesic BVP.
+    If eta_guess is provided, search locally. If not,
+    do a coarse global scan first.
     """
     intervals = []
 
     if eta_guess is not None:
+        # if we are provided with an eta_guess then we make a window about it and search locally
         intervals.append((eta_guess - window, eta_guess + window))
     else:
         grid = np.linspace(0.0, 1.0, global_grid, endpoint=False)
+
+        # typically obkective(s) = d(gamma(s), q)^2
         values = np.array([objective(s) for s in grid])
+
+        # the indicies of the n smallest objective vals 
         best_indices = np.argsort(values)[:candidates]
         step = 1.0 / global_grid
 
@@ -228,6 +234,7 @@ def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidat
     best_eta = None
     best_value = np.inf
 
+    # search over intervals about the n smallest objective values
     for a, b in intervals:
         result = minimize_scalar(
             lambda s: objective(normalize_eta(s)),
@@ -243,12 +250,10 @@ def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidat
 
 def closest_eta_xi_exact(q, path, eta_guess=None):
     """
-    Exact Riemannian version:
+    Exact version:
 
-        eta = argmin_s || Log^geodesic_gamma(s)(q) ||_M^2
-        xi  = Log^geodesic_gamma(eta)(q)
-
-    This is theoretically clean but expensive because Log solves a BVP.
+        eta = argmin_s || Log_gamma(s)(q) ||_M^2
+        xi  = Log_gamma(eta)(q)
     """
     q = CONFIG_MANIFOLD.project(q)
 
@@ -271,12 +276,10 @@ def closest_eta_xi_fast(q, path, eta_guess=None):
         delta = wrapped joint-space displacement from gamma(s) to q
         eta   = argmin_s delta^T M(gamma(s)) delta
         xi    = delta
-
-    This keeps the kinetic-energy metric in the inner product, but avoids
-    solving geodesic BVPs inside the controller.
     """
     q = CONFIG_MANIFOLD.project(q)
 
+    # TODO: check if this concides with lie group exponential/log...
     def objective(s):
         p = path.eval(s)
         xi = CONFIG_MANIFOLD.log(p, q)
@@ -295,7 +298,7 @@ def displacement_from_path(s, q, method="fast"):
         return Q_EXACT.Log(p, q)
     if method == "fast":
         return CONFIG_MANIFOLD.log(p, q)
-    raise ValueError("method must be 'exact' or 'fast'.")
+    raise ValueError("method must be 'exact', or 'fast'.")
 
 
 def eta_xi_transform(q, eta_guess=None, method="fast"):
@@ -306,10 +309,10 @@ def eta_xi_transform(q, eta_guess=None, method="fast"):
         eta, p, xi_vec = closest_eta_xi_fast(q, configuration_path, eta_guess)
         Q = Q_FAST
     else:
-        raise ValueError("method must be 'exact' or 'fast'.")
+        raise ValueError("method must be 'exact', or 'fast'.")
 
-    tangent = metric_unit_tangent(Q, configuration_path, eta)
-    normal = metric_unit_normal(Q, p, tangent)
+    tangent = unit_tangent(Q, configuration_path, eta)
+    normal = unit_normal(Q, p, tangent)
     xi_scalar = Q.inner(p, xi_vec, normal)
 
     return eta, xi_scalar
@@ -319,6 +322,7 @@ def eta_xi_transform(q, eta_guess=None, method="fast"):
 # Path-following controllers
 # ============================================================
 
+# Gains
 controller_params = {
     "path_speed": 0.25,
     "eta_velocity_gain": 8.0,
@@ -335,55 +339,47 @@ def closest_path_coordinates(q, path, eta_guess, method):
         Q = Q_FAST
         eta, p, xi_vec = closest_eta_xi_fast(q, path, eta_guess)
     else:
-        raise ValueError("method must be 'exact' or 'fast'.")
+        raise ValueError("method must be 'exact', of 'fast'")
 
-    tangent = metric_unit_tangent(Q, path, eta)
-    normal = metric_unit_normal(Q, p, tangent)
+    tangent = unit_tangent(Q, path, eta)
+    normal = unit_normal(Q, p, tangent)
     xi_scalar = Q.inner(p, xi_vec, normal)
 
     return Q, eta, p, tangent, normal, xi_scalar
 
-
-def tubular_point(path, Q, eta, xi, method):
+# Phi: (eta, xi) -> q
+def phi(path, Q, eta, xi, method):
     """
-    Local path chart used by the controller:
-
+    Map (eta, xi) -> q by:
         q = Phi(eta, xi) = Exp_gamma(eta)(xi N(eta)).
-
-    For the fast method, Exp is the wrapped joint-space chart exponential. For
-    the exact method, Exp is the numerical geodesic IVP for the kinetic-energy
-    metric, so it is intentionally much slower.
     """
     p = path.eval(eta)
-    tangent = metric_unit_tangent(Q, path, eta)
-    normal = metric_unit_normal(Q, p, tangent)
+    tangent = unit_tangent(Q, path, eta)
+    normal = unit_normal(Q, p, tangent)
     displacement = float(xi) * normal
 
     if method == "exact":
         return Q.Exp(p, displacement)
     if method == "fast":
         return CONFIG_MANIFOLD.exp(p, displacement)
-    raise ValueError("method must be 'exact' or 'fast'.")
+    raise ValueError("method must be 'exact', of 'fast'")
 
-
-def tubular_jacobian(path, Q, eta, xi, method, eps_eta=1e-5, eps_xi=1e-5):
+# D Phi
+def phi_jacobian(path, Q, eta, xi, method, eps_eta=1e-5, eps_xi=1e-5):
     """
     Numerically compute D Phi(eta, xi).
-
-    The columns map [eta_dot, xi_dot] to qdot. Differences are taken with the
-    wrapped manifold logarithm so revolute joints use the local branch.
     """
-    q0 = tubular_point(path, Q, eta, xi, method)
+    q0 = phi(path, Q, eta, xi, method)
 
-    q_eta_plus = tubular_point(path, Q, eta + eps_eta, xi, method)
-    q_eta_minus = tubular_point(path, Q, eta - eps_eta, xi, method)
+    q_eta_plus = phi(path, Q, eta + eps_eta, xi, method)
+    q_eta_minus = phi(path, Q, eta - eps_eta, xi, method)
     d_eta = (
         CONFIG_MANIFOLD.log(q0, q_eta_plus)
         - CONFIG_MANIFOLD.log(q0, q_eta_minus)
     ) / (2.0 * eps_eta)
 
-    q_xi_plus = tubular_point(path, Q, eta, xi + eps_xi, method)
-    q_xi_minus = tubular_point(path, Q, eta, xi - eps_xi, method)
+    q_xi_plus = phi(path, Q, eta, xi + eps_xi, method)
+    q_xi_minus = phi(path, Q, eta, xi - eps_xi, method)
     d_xi = (
         CONFIG_MANIFOLD.log(q0, q_xi_plus)
         - CONFIG_MANIFOLD.log(q0, q_xi_minus)
@@ -391,25 +387,9 @@ def tubular_jacobian(path, Q, eta, xi, method, eps_eta=1e-5, eps_xi=1e-5):
 
     return np.column_stack((d_eta, d_xi))
 
-
-def solve_output_velocity(J, qdot):
-    """
-    Recover [eta_dot, xi_dot] from qdot = D Phi(eta, xi) ydot.
-    """
-    try:
-        return np.linalg.solve(J, qdot)
-    except np.linalg.LinAlgError:
-        ydot, *_ = np.linalg.lstsq(J, qdot, rcond=None)
-        return ydot
-
-
 def jacobian_dot_times_output_velocity(path, Q, eta, xi, ydot, method):
     """
     Directional derivative (d/dt D Phi) ydot.
-
-    This is the centripetal/path-curvature term missing from the previous
-    velocity-field controller. It is evaluated numerically to keep the example
-    close to the math without deriving a long expression for every path type.
     """
     if np.linalg.norm(ydot) < 1e-12:
         return np.zeros(Q.dim)
@@ -420,8 +400,8 @@ def jacobian_dot_times_output_velocity(path, Q, eta, xi, ydot, method):
     eta_minus = eta - eps_time * ydot[0]
     xi_minus = xi - eps_time * ydot[1]
 
-    J_plus = tubular_jacobian(path, Q, eta_plus, xi_plus, method)
-    J_minus = tubular_jacobian(path, Q, eta_minus, xi_minus, method)
+    J_plus = phi_jacobian(path, Q, eta_plus, xi_plus, method)
+    J_minus = phi_jacobian(path, Q, eta_minus, xi_minus, method)
 
     Jdot = (J_plus - J_minus) / (2.0 * eps_time)
     return Jdot @ ydot
@@ -476,8 +456,8 @@ def computed_torque_path_controller(state, path, eta_guess, method):
         method,
     )
 
-    J = tubular_jacobian(path, Q, eta, xi, method)
-    eta_dot, xi_dot = solve_output_velocity(J, qdot)
+    J = phi_jacobian(path, Q, eta, xi, method)
+    eta_dot, xi_dot = np.linalg.solve(J, qdot)
 
     eta_dot_ref = desired_eta_rate(Q, path, eta)
     eta_ddot_ref = desired_eta_acceleration(Q, path, eta)
@@ -506,30 +486,10 @@ def computed_torque_path_controller(state, path, eta_guess, method):
 
     return tau, eta, xi
 
-
-def path_following_controller_exact(state, eta_guess=None, path=configuration_path):
-    return computed_torque_path_controller(state, path, eta_guess, method="exact")
-
-
-def path_following_controller_fast(state, eta_guess=None, path=configuration_path):
-    return computed_torque_path_controller(state, path, eta_guess, method="fast")
-
-
-def path_following_controller(state, eta_guess=None):
-    """
-    Backwards-compatible default used by tests and quick experiments.
-    """
-    return path_following_controller_fast(state, eta_guess=eta_guess)
-
-
-# ============================================================
-# Numerical integration
-# ============================================================
-
+# Integrator steps
 def euler_step(state, tau, dt):
     next_state = state + dt * state_dot(state, tau)
     return wrap_state(next_state)
-
 
 def rk4_step(state, tau_func, dt):
     def f(x):
@@ -545,7 +505,9 @@ def rk4_step(state, tau_func, dt):
 
     return wrap_state(next_state)
 
-
+####################################
+# Main sim loop
+####################################
 def simulate_path_following(
     state0,
     dt=0.005,
@@ -572,6 +534,7 @@ def simulate_path_following(
     }
 
     for k in range(n_steps):
+        print("step " + str(k) + " of " + str(n_steps))
         step_start = time.perf_counter()
         t = k * dt
 
@@ -611,7 +574,7 @@ def simulate_path_following(
 
     return history
 
-
+# Plottint
 def timing_summary(name, history):
     step_time = history["step_time"]
     if len(step_time) == 0:
@@ -688,7 +651,6 @@ def plot_single_summary(history, path, title):
     fig.tight_layout()
     plt.show()
 
-
 def plot_comparison(exact_hist, fast_hist, path):
     import matplotlib.pyplot as plt
 
@@ -726,6 +688,42 @@ def plot_comparison(exact_hist, fast_hist, path):
     fig.tight_layout()
     plt.show()
 
+def plot_two_method_comparison(first_hist, second_hist, path, first_label, second_label):
+    import matplotlib.pyplot as plt
+
+    path_grid = np.linspace(0.0, 1.0, 400)
+    path_points = np.array([path.eval(s) for s in path_grid])
+
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+
+    axs[0, 0].plot(path_points[:, 0], path_points[:, 1], label="path")
+    axs[0, 0].plot(first_hist["q"][:, 0], first_hist["q"][:, 1], label=first_label)
+    axs[0, 0].plot(second_hist["q"][:, 0], second_hist["q"][:, 1], label=second_label)
+    axs[0, 0].axis("equal")
+    axs[0, 0].grid(True)
+    axs[0, 0].legend()
+    axs[0, 0].set_title("Configuration-space trajectory")
+
+    axs[0, 1].plot(first_hist["t"], first_hist["xi"], label=first_label)
+    axs[0, 1].plot(second_hist["t"], second_hist["xi"], label=second_label)
+    axs[0, 1].grid(True)
+    axs[0, 1].legend()
+    axs[0, 1].set_title("Transverse coordinate xi")
+
+    axs[1, 0].plot(first_hist["t"], first_hist["step_time"], label=first_label)
+    axs[1, 0].plot(second_hist["t"], second_hist["step_time"], label=second_label)
+    axs[1, 0].grid(True)
+    axs[1, 0].legend()
+    axs[1, 0].set_title("Wall-clock time per simulation step")
+
+    axs[1, 1].plot(first_hist["t"], first_hist["eta"], label=first_label)
+    axs[1, 1].plot(second_hist["t"], second_hist["eta"], label=second_label)
+    axs[1, 1].grid(True)
+    axs[1, 1].legend()
+    axs[1, 1].set_title("Path coordinate eta")
+
+    fig.tight_layout()
+    plt.show()
 
 def compare_exact_and_fast(
     state0,
@@ -768,12 +766,10 @@ def compare_exact_and_fast(
     return exact, fast
 
 
-# ============================================================
-# Example usage
-# ============================================================
+# Example
 
 if __name__ == "__main__":
-    q0 = np.array([1.0, 1.0])
+    q0 = np.array([0.1, 0.1])
     qdot0 = np.array([0.0, 0.0])
     state0 = np.column_stack((q0, qdot0))
 
@@ -799,6 +795,12 @@ if __name__ == "__main__":
         )
         if show_plot:
             plot_comparison(exact_hist, fast_hist, configuration_path)
+        if show_plot:
+            plot_two_method_comparison(
+                fast_hist,
+                configuration_path,
+                "fast",
+            )
     elif sim_mode in ("fast", "exact"):
         print(f"Running {sim_mode} simulation...")
         hist = simulate_path_following(
@@ -813,4 +815,4 @@ if __name__ == "__main__":
         if show_plot:
             plot_single_summary(hist, configuration_path, f"{sim_mode} simulation")
     else:
-        raise ValueError("SIM_MODE must be 'compare', 'fast', or 'exact'.")
+        raise ValueError("SIM_MODE must be 'compare', 'fast', 'exact'.")

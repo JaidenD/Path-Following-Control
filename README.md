@@ -32,6 +32,9 @@ This compares two kinetic-energy-metric simulations:
 
 - `exact`: closest-point projection uses geodesic BVP solves for `Log`.
 - `fast`: closest-point projection uses wrapped joint displacement with the kinetic-energy metric inner product.
+- `lie`: closest-point projection uses the Lie group logarithm/exponential on
+  \(S^1 \times S^1\). For the two-link torus this is the same wrapped angle
+  formula as `fast`, but it is named explicitly as a Lie group construction.
 
 Both simulations use the same transverse feedback-linearizing controller in
 local path coordinates. The fast simulation is the one to use for interactive
@@ -51,6 +54,18 @@ Run only the exact simulation:
 
 ```bash
 SIM_MODE=exact python3 Examples/two_link_manipulator.py
+```
+
+Run only the Lie group simulation:
+
+```bash
+SIM_MODE=lie python3 Examples/two_link_manipulator.py
+```
+
+Compare the fast and Lie group methods:
+
+```bash
+SIM_MODE=compare_lie python3 Examples/two_link_manipulator.py
 ```
 
 To try different non-self-intersecting test paths:
