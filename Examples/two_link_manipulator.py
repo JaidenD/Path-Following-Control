@@ -135,10 +135,10 @@ def wrap_state(state):
 # Q_EXACT.Log(p, q) solves the geodesic boundary-value problem for M(q).
 Q_EXACT = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix)
 
-# Fast method:
-# Q_FAST.Log(p, q) uses the wrapped joint-space chart displacement, while
-# Q_FAST.inner/norm still use the kinetic-energy metric M(q).
-Q_FAST = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix, use_analytic=True)
+# approximate method:
+# Q_APPROXIMATE.Log(p, q) uses the wrapped joint-space chart displacement, while
+# Q_APPROXIMATE.inner/norm still use the kinetic-energy metric M(q).
+Q_APPROXIMATE = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix, use_analytic=True)
 
 # Setup test paths
 
@@ -155,7 +155,7 @@ def make_spline_test_path(Q):
     return CubicSplinePath(Q, waypoints, closed=True, bc_type="periodic")
 
 
-def make_configuration_path(kind=PATH_KIND, Q=Q_FAST):
+def make_configuration_path(kind=PATH_KIND, Q=Q_APPROXIMATE):
     if kind == "circle":
         return coordinate_circle_path(Q, radius=0.8)
     if kind == "spline":
@@ -163,7 +163,7 @@ def make_configuration_path(kind=PATH_KIND, Q=Q_FAST):
     raise ValueError(f"Unknown path kind {kind!r}. Use 'circle' or 'spline'.")
 
 
-configuration_path = make_configuration_path(PATH_KIND, Q_FAST)
+configuration_path = make_configuration_path(PATH_KIND, Q_APPROXIMATE)
 
 
 # Set up frame
@@ -247,7 +247,7 @@ def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidat
 
     return best_eta
 
-
+# Map psi: q -> (eta, xi)
 def closest_eta_xi_exact(q, path, eta_guess=None):
     """
     Exact version:
@@ -268,10 +268,9 @@ def closest_eta_xi_exact(q, path, eta_guess=None):
 
     return eta, p, xi
 
-
-def closest_eta_xi_fast(q, path, eta_guess=None):
+def closest_eta_xi_approximate(q, path, eta_guess=None):
     """
-    Fast local version:
+    Approximate local version:
 
         delta = wrapped joint-space displacement from gamma(s) to q
         eta   = argmin_s delta^T M(gamma(s)) delta
@@ -283,39 +282,13 @@ def closest_eta_xi_fast(q, path, eta_guess=None):
     def objective(s):
         p = path.eval(s)
         xi = CONFIG_MANIFOLD.log(p, q)
-        return Q_FAST.squared_norm(p, xi)
+        return Q_APPROXIMATE.squared_norm(p, xi)
 
     eta = minimize_eta(objective, eta_guess=eta_guess)
     p = path.eval(eta)
     xi = CONFIG_MANIFOLD.log(p, q)
 
     return eta, p, xi
-
-
-def displacement_from_path(s, q, method="fast"):
-    p = gamma(s)
-    if method == "exact":
-        return Q_EXACT.Log(p, q)
-    if method == "fast":
-        return CONFIG_MANIFOLD.log(p, q)
-    raise ValueError("method must be 'exact', or 'fast'.")
-
-
-def eta_xi_transform(q, eta_guess=None, method="fast"):
-    if method == "exact":
-        eta, p, xi_vec = closest_eta_xi_exact(q, configuration_path, eta_guess)
-        Q = Q_EXACT
-    elif method == "fast":
-        eta, p, xi_vec = closest_eta_xi_fast(q, configuration_path, eta_guess)
-        Q = Q_FAST
-    else:
-        raise ValueError("method must be 'exact', or 'fast'.")
-
-    tangent = unit_tangent(Q, configuration_path, eta)
-    normal = unit_normal(Q, p, tangent)
-    xi_scalar = Q.inner(p, xi_vec, normal)
-
-    return eta, xi_scalar
 
 
 # ============================================================
@@ -330,16 +303,16 @@ controller_params = {
     "xi_velocity_gain": 8.0,
 }
 
-
+# setup coordinates and frame
 def closest_path_coordinates(q, path, eta_guess, method):
     if method == "exact":
         Q = Q_EXACT
         eta, p, xi_vec = closest_eta_xi_exact(q, path, eta_guess)
-    elif method == "fast":
-        Q = Q_FAST
-        eta, p, xi_vec = closest_eta_xi_fast(q, path, eta_guess)
+    elif method == "approximate":
+        Q = Q_APPROXIMATE
+        eta, p, xi_vec = closest_eta_xi_approximate(q, path, eta_guess)
     else:
-        raise ValueError("method must be 'exact', of 'fast'")
+        raise ValueError("method must be 'exact', of 'approximate'")
 
     tangent = unit_tangent(Q, path, eta)
     normal = unit_normal(Q, p, tangent)
@@ -360,11 +333,11 @@ def phi(path, Q, eta, xi, method):
 
     if method == "exact":
         return Q.Exp(p, displacement)
-    if method == "fast":
+    if method == "approximate":
         return CONFIG_MANIFOLD.exp(p, displacement)
-    raise ValueError("method must be 'exact', of 'fast'")
+    raise ValueError("method must be 'exact', of 'approximate'")
 
-# D Phi
+# numerically compute D Phi
 def phi_jacobian(path, Q, eta, xi, method, eps_eta=1e-5, eps_xi=1e-5):
     """
     Numerically compute D Phi(eta, xi).
@@ -387,6 +360,7 @@ def phi_jacobian(path, Q, eta, xi, method, eps_eta=1e-5, eps_xi=1e-5):
 
     return np.column_stack((d_eta, d_xi))
 
+# numerically compute d/dt D phi @ ydot
 def jacobian_dot_times_output_velocity(path, Q, eta, xi, ydot, method):
     """
     Directional derivative (d/dt D Phi) ydot.
@@ -406,14 +380,10 @@ def jacobian_dot_times_output_velocity(path, Q, eta, xi, ydot, method):
     Jdot = (J_plus - J_minus) / (2.0 * eps_time)
     return Jdot @ ydot
 
-
+# eta isnt length parameterized so we need to convert rates
 def desired_eta_rate(Q, path, eta):
     """
     Convert the desired metric speed along the path to eta_dot.
-
-    Since eta parameterizes the curve on [0, 1], gamma'(eta) is not generally
-    unit speed. The scalar eta_dot below makes ||gamma'(eta) eta_dot||_M equal
-    controller_params["path_speed"].
     """
     p = path.eval(eta)
     gamma_eta = path.derivative(eta)
@@ -423,7 +393,7 @@ def desired_eta_rate(Q, path, eta):
 
 def desired_eta_acceleration(Q, path, eta):
     """
-    Feedforward eta_ddot for a constant metric-speed reference.
+    Calculate ddot eta
     """
     h = 1e-5
     rate_plus = desired_eta_rate(Q, path, eta + h)
@@ -432,7 +402,9 @@ def desired_eta_acceleration(Q, path, eta):
     rate = desired_eta_rate(Q, path, eta)
     return d_rate_d_eta * rate
 
-
+####################################
+# Controller
+####################################
 def computed_torque_path_controller(state, path, eta_guess, method):
     """
     Transverse feedback linearization in local path coordinates.
@@ -442,9 +414,8 @@ def computed_torque_path_controller(state, path, eta_guess, method):
         qdot  = D Phi(y) ydot
         qddot = D Phi(y) yddot + d/dt(D Phi(y)) ydot
 
-    and chooses yddot so eta tracks a path-speed reference while xi is a
-    damped second-order transverse coordinate. The final computed-torque step
-    handles the manipulator dynamics M(q)qddot + C(q,qdot)qdot + G(q).
+    and chooses yddot so eta tracks a path-speed reference while xi is
+    stabilized to zero.
     """
     q = CONFIG_MANIFOLD.project(state[:, 0])
     qdot = state[:, 1]
@@ -513,7 +484,7 @@ def simulate_path_following(
     dt=0.005,
     T_final=0.05,
     use_rk4=False,
-    method="fast",
+    method="approximate",
     path=configuration_path,
 ):
     """
@@ -651,7 +622,7 @@ def plot_single_summary(history, path, title):
     fig.tight_layout()
     plt.show()
 
-def plot_comparison(exact_hist, fast_hist, path):
+def plot_comparison(exact_hist, approximate_hist, path):
     import matplotlib.pyplot as plt
 
     path_grid = np.linspace(0.0, 1.0, 400)
@@ -661,26 +632,26 @@ def plot_comparison(exact_hist, fast_hist, path):
 
     axs[0, 0].plot(path_points[:, 0], path_points[:, 1], label="path")
     axs[0, 0].plot(exact_hist["q"][:, 0], exact_hist["q"][:, 1], label="exact")
-    axs[0, 0].plot(fast_hist["q"][:, 0], fast_hist["q"][:, 1], label="fast")
+    axs[0, 0].plot(approximate_hist["q"][:, 0], approximate_hist["q"][:, 1], label="approximate")
     axs[0, 0].axis("equal")
     axs[0, 0].grid(True)
     axs[0, 0].legend()
     axs[0, 0].set_title("Configuration-space trajectory")
 
     axs[0, 1].plot(exact_hist["t"], exact_hist["xi"], label="exact")
-    axs[0, 1].plot(fast_hist["t"], fast_hist["xi"], label="fast")
+    axs[0, 1].plot(approximate_hist["t"], approximate_hist["xi"], label="approximate")
     axs[0, 1].grid(True)
     axs[0, 1].legend()
     axs[0, 1].set_title("Transverse coordinate xi")
 
     axs[1, 0].plot(exact_hist["t"], exact_hist["step_time"], label="exact")
-    axs[1, 0].plot(fast_hist["t"], fast_hist["step_time"], label="fast")
+    axs[1, 0].plot(approximate_hist["t"], approximate_hist["step_time"], label="approximate")
     axs[1, 0].grid(True)
     axs[1, 0].legend()
     axs[1, 0].set_title("Wall-clock time per simulation step")
 
     axs[1, 1].plot(exact_hist["t"], exact_hist["eta"], label="exact")
-    axs[1, 1].plot(fast_hist["t"], fast_hist["eta"], label="fast")
+    axs[1, 1].plot(approximate_hist["t"], approximate_hist["eta"], label="approximate")
     axs[1, 1].grid(True)
     axs[1, 1].legend()
     axs[1, 1].set_title("Path coordinate eta")
@@ -725,7 +696,7 @@ def plot_two_method_comparison(first_hist, second_hist, path, first_label, secon
     fig.tight_layout()
     plt.show()
 
-def compare_exact_and_fast(
+def compare_exact_and_approximate(
     state0,
     dt=0.005,
     T_final=0.025,
@@ -733,7 +704,7 @@ def compare_exact_and_fast(
     path=configuration_path,
 ):
     """
-    Run the exact geodesic controller and fast local controller on the same
+    Run the exact geodesic controller and approximate local controller on the same
     two-link arm and print per-step timing statistics.
     """
     print("Running exact geodesic-BVP metric simulation...")
@@ -746,24 +717,24 @@ def compare_exact_and_fast(
         path=path,
     )
 
-    print("Running fast local metric simulation...")
-    fast = simulate_path_following(
+    print("Running approximate local metric simulation...")
+    approximate = simulate_path_following(
         state0,
         dt=dt,
         T_final=T_final,
         use_rk4=use_rk4,
-        method="fast",
+        method="approximate",
         path=path,
     )
 
     timing_summary("Exact geodesic BVP metric", exact)
-    timing_summary("Fast local metric", fast)
+    timing_summary("Approximate local metric", approximate)
 
-    if len(exact["step_time"]) and len(fast["step_time"]):
-        ratio = np.mean(exact["step_time"]) / np.mean(fast["step_time"])
+    if len(exact["step_time"]) and len(approximate["step_time"]):
+        ratio = np.mean(exact["step_time"]) / np.mean(approximate["step_time"])
         print(f"\nMean-step speedup: {ratio:.1f}x")
 
-    return exact, fast
+    return exact, approximate
 
 
 # Example
@@ -786,7 +757,7 @@ if __name__ == "__main__":
     print(f"use_rk4 = {use_rk4}")
 
     if sim_mode == "compare":
-        exact_hist, fast_hist = compare_exact_and_fast(
+        exact_hist, approximate_hist = compare_exact_and_approximate(
             state0,
             dt=dt,
             T_final=T_final,
@@ -794,14 +765,14 @@ if __name__ == "__main__":
             path=configuration_path,
         )
         if show_plot:
-            plot_comparison(exact_hist, fast_hist, configuration_path)
+            plot_comparison(exact_hist, approximate_hist, configuration_path)
         if show_plot:
             plot_two_method_comparison(
-                fast_hist,
+                approximate_hist,
                 configuration_path,
-                "fast",
+                "approximate",
             )
-    elif sim_mode in ("fast", "exact"):
+    elif sim_mode in ("approximate", "exact"):
         print(f"Running {sim_mode} simulation...")
         hist = simulate_path_following(
             state0,
@@ -815,4 +786,4 @@ if __name__ == "__main__":
         if show_plot:
             plot_single_summary(hist, configuration_path, f"{sim_mode} simulation")
     else:
-        raise ValueError("SIM_MODE must be 'compare', 'fast', 'exact'.")
+        raise ValueError("SIM_MODE must be 'compare', 'approximate', 'exact'.")
