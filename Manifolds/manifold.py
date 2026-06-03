@@ -93,6 +93,17 @@ class RiemannianManifold:
             raise ValueError("Metric must be symmetric.")
 
         self.use_analytic = self._constant_metric is not None if use_analytic is None else bool(use_analytic)
+        self._solver_diagnostics = {
+            "bvp_calls": 0,
+            "ivp_calls": 0,
+        }
+
+    def reset_solver_diagnostics(self) -> None:
+        self._solver_diagnostics["bvp_calls"] = 0
+        self._solver_diagnostics["ivp_calls"] = 0
+
+    def solver_diagnostics(self) -> dict[str, int]:
+        return dict(self._solver_diagnostics)
 
     def coordinate(self, q: np.ndarray) -> np.ndarray:
         return self.Q.coordinate(q)
@@ -120,21 +131,23 @@ class RiemannianManifold:
 
     def squared_norm(self, q: np.ndarray, v: np.ndarray) -> float:
         return self.inner(q, v, v)
-
+    
     def Exp(self, q: np.ndarray, v: np.ndarray) -> np.ndarray:
         if self.use_analytic:
             return self.Q.exp(q, v)
 
         from Numerics.geodesic_bvp import solve_geodesic_ivp
 
+        self._solver_diagnostics["ivp_calls"] += 1
         return solve_geodesic_ivp(self, q, v)
 
     def Log(self, q: np.ndarray, p: np.ndarray) -> np.ndarray:
         if self.use_analytic:
             return self.Q.log(q, p)
-
+        
         from Numerics.geodesic_bvp import solve_geodesic_bvp
-
+        
+        self._solver_diagnostics["bvp_calls"] += 1
         _, xi = solve_geodesic_bvp(self, q, p)
         return xi
 
@@ -144,3 +157,4 @@ class RiemannianManifold:
 
     def interpolate(self, q: np.ndarray, p: np.ndarray, u: float) -> np.ndarray:
         return self.Exp(q, float(u) * self.Log(q, p))
+

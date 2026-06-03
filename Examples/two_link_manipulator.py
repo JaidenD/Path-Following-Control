@@ -32,10 +32,8 @@ params = {
     "g": 9.81,
 }
 
-
-# ============================================================
-# Two-link manipulator dynamics
-# ============================================================
+#####################################
+# Manipulator dynamics
 
 def mass_matrix(q):
     """
@@ -120,24 +118,15 @@ def state_dot(state, tau):
     return np.column_stack((qdot, qddot))
 
 def wrap_state(state):
-    """
-    Wrap only the joint angles. This is topological projection, not the
-    Riemannian exponential map.
-    """
     q = CONFIG_MANIFOLD.project(state[:, 0])
     qdot = state[:, 1]
     return np.column_stack((q, qdot))
+#####################################
 
-
-# Metrics used in the comparison
-
-# Exact method:
 # Q_EXACT.Log(p, q) solves the geodesic boundary-value problem for M(q).
 Q_EXACT = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix)
 
-# approximate method:
-# Q_APPROXIMATE.Log(p, q) uses the wrapped joint-space chart displacement, while
-# Q_APPROXIMATE.inner/norm still use the kinetic-energy metric M(q).
+# Q_APPROXIMATE.Log(p, q) uses the chart displacement, while
 Q_APPROXIMATE = RiemannianManifold(CONFIG_MANIFOLD, mass_matrix, use_analytic=True)
 
 # Setup test paths
@@ -198,12 +187,10 @@ def unit_normal(Q, p, tangent):
     normal = np.array([-alpha[1], alpha[0]])
     return normal / Q.norm(p, normal)
 
-
 def normalize_eta(s, closed=True):
     if closed:
         return float(s % 1.0)
     return float(np.clip(s, 0.0, 1.0))
-
 
 def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidates=4):
     """
@@ -220,7 +207,7 @@ def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidat
     else:
         grid = np.linspace(0.0, 1.0, global_grid, endpoint=False)
 
-        # typically obkective(s) = d(gamma(s), q)^2
+        # typically objective(s) = d(gamma(s), q)^2
         values = np.array([objective(s) for s in grid])
 
         # the indicies of the n smallest objective vals 
@@ -271,14 +258,12 @@ def closest_eta_xi_exact(q, path, eta_guess=None):
 def closest_eta_xi_approximate(q, path, eta_guess=None):
     """
     Approximate local version:
-
         delta = wrapped joint-space displacement from gamma(s) to q
         eta   = argmin_s delta^T M(gamma(s)) delta
         xi    = delta
     """
     q = CONFIG_MANIFOLD.project(q)
 
-    # TODO: check if this concides with lie group exponential/log...
     def objective(s):
         p = path.eval(s)
         xi = CONFIG_MANIFOLD.log(p, q)
@@ -388,7 +373,7 @@ def desired_eta_rate(Q, path, eta):
     p = path.eval(eta)
     gamma_eta = path.derivative(eta)
     path_parameter_speed = Q.norm(p, gamma_eta)
-    return controller_params["path_speed"] / max(path_parameter_speed, 1e-9)
+    return controller_params["path_speed"] / max(path_parameter_speed, 1e-9) #* np.sin(2.0 * np.pi * eta)
 
 
 def desired_eta_acceleration(Q, path, eta):
@@ -502,43 +487,77 @@ def simulate_path_following(
         "xi": [],
         "tau": [],
         "step_time": [],
+        "bvp_calls": [],
+        "ivp_calls": [],
     }
 
     for k in range(n_steps):
         print("step " + str(k) + " of " + str(n_steps))
+        Q_EXACT.reset_solver_diagnostics()
         step_start = time.perf_counter()
         t = k * dt
 
-        tau, eta, xi = computed_torque_path_controller(
-            state,
-            path,
-            eta_guess,
-            method=method,
-        )
-        eta_guess = eta
+        try:
+            tau, eta, xi = computed_torque_path_controller(
+                state,
+                path,
+                eta_guess,
+                method=method,
+            )
+            eta_guess = eta
 
-        history["t"].append(t)
-        history["q"].append(state[:, 0].copy())
-        history["qdot"].append(state[:, 1].copy())
-        history["eta"].append(eta)
-        history["xi"].append(xi)
-        history["tau"].append(tau.copy())
+            history["t"].append(t)
+            history["q"].append(state[:, 0].copy())
+            history["qdot"].append(state[:, 1].copy())
+            history["eta"].append(eta)
+            history["xi"].append(xi)
+            history["tau"].append(tau.copy())
 
-        if use_rk4:
-            def tau_func(x):
-                tau_x, _, _ = computed_torque_path_controller(
-                    x,
-                    path,
-                    eta_guess,
-                    method=method,
+            if use_rk4:
+                def tau_func(x):
+                    tau_x, _, _ = computed_torque_path_controller(
+                        x,
+                        path,
+                        eta_guess,
+                        method=method,
+                    )
+                    return tau_x
+
+                state = rk4_step(state, tau_func, dt)
+            else:
+                state = euler_step(state, tau, dt)
+        except Exception:
+            diagnostics = Q_EXACT.solver_diagnostics()
+            if (
+                method == "exact"
+                or diagnostics["bvp_calls"] > 0
+                or diagnostics["ivp_calls"] > 0
+            ):
+                print(
+                    "  exact solver calls before failure: "
+                    + "BVP="
+                    + str(diagnostics["bvp_calls"])
+                    + ", IVP="
+                    + str(diagnostics["ivp_calls"])
                 )
-                return tau_x
+            raise
 
-            state = rk4_step(state, tau_func, dt)
-        else:
-            state = euler_step(state, tau, dt)
-
+        diagnostics = Q_EXACT.solver_diagnostics()
         history["step_time"].append(time.perf_counter() - step_start)
+        history["bvp_calls"].append(diagnostics["bvp_calls"])
+        history["ivp_calls"].append(diagnostics["ivp_calls"])
+        if (
+            method == "exact"
+            or diagnostics["bvp_calls"] > 0
+            or diagnostics["ivp_calls"] > 0
+        ):
+            print(
+                "  exact solver calls this step: "
+                + "BVP="
+                + str(diagnostics["bvp_calls"])
+                + ", IVP="
+                + str(diagnostics["ivp_calls"])
+            )
 
     for key in history:
         history[key] = np.array(history[key])
@@ -740,7 +759,9 @@ def compare_exact_and_approximate(
 # Example
 
 if __name__ == "__main__":
-    q0 = np.array([0.1, 0.1])
+    ic = os.environ.get("q0", "0.1,0.1")
+    ic = ic.split(',')
+    q0 = np.array([float(ic[0]), float(ic[1])])
     qdot0 = np.array([0.0, 0.0])
     state0 = np.column_stack((q0, qdot0))
 
