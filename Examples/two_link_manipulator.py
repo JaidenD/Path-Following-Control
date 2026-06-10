@@ -201,16 +201,14 @@ def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidat
     """
     intervals = []
 
+    # If provided with eta_guess then make an interval centered at it and search locally
     if eta_guess is not None:
-        # if we are provided with an eta_guess then we make a window about it and search locally
         intervals.append((eta_guess - window, eta_guess + window))
     else:
         grid = np.linspace(0.0, 1.0, global_grid, endpoint=False)
-
-        # typically objective(s) = d(gamma(s), q)^2
         values = np.array([objective(s) for s in grid])
 
-        # the indicies of the n smallest objective vals 
+        # The indicies of the n smallest objective vals 
         best_indices = np.argsort(values)[:candidates]
         step = 1.0 / global_grid
 
@@ -243,12 +241,16 @@ def closest_eta_xi_exact(q, path, eta_guess=None):
         xi  = Log_gamma(eta)(q)
     """
     q = CONFIG_MANIFOLD.project(q)
-
+    
+    # Math: g_{\gamma(s)}(\mathrm{Log}_{\gamma(s)}(q))
     def objective(s):
         p = path.eval(s)
-        xi = Q_EXACT.Log(p, q)
+        xi = Q_EXACT.Log(p, q) # Log integrates geodesic bvp in (-pi, pi) coordinate chart
         return Q_EXACT.squared_norm(p, xi)
 
+
+    # Math: \xi := Log_\eta(q), \eta := \mathrm{argmin}_s g_{\gamma(s)}(\xi, \xi)
+    # Math: \mathrm{argmin}_s g_{\gamma(s)}(\mathrm{Log}_{\gamma(s)}(q), \mathrm{Log}_{\gamma(s)}(q))
     eta = minimize_eta(objective, eta_guess=eta_guess)
     p = path.eval(eta)
     xi = Q_EXACT.Log(p, q)
@@ -266,7 +268,9 @@ def closest_eta_xi_approximate(q, path, eta_guess=None):
 
     def objective(s):
         p = path.eval(s)
-        xi = CONFIG_MANIFOLD.log(p, q)
+        xi = CONFIG_MANIFOLD.log(p, q) # Approximate connection to be flat => 
+        # Math: \mathrm{log}_p(q) = \phi(p) - \phi(q), \phi: Q \supseteq U \to \mathbb{R}^{\dim{Q}}
+
         return Q_APPROXIMATE.squared_norm(p, xi)
 
     eta = minimize_eta(objective, eta_guess=eta_guess)

@@ -6,7 +6,7 @@ from Manifolds.manifold import Manifold
 
 
 def wrap_angle(theta):
-    """Wrap angles to (-pi, pi]."""
+    """Project angles to principle branch (-pi, pi]."""
     return (np.asarray(theta, dtype=float) + np.pi) % (2.0 * np.pi) - np.pi
 
 

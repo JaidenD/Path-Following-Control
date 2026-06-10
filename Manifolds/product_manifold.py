@@ -2,7 +2,6 @@ import numpy as np
 
 from Manifolds.manifold import Manifold
 
-
 class ProductManifold(Manifold):
     """Cartesian product of coordinate manifolds."""
 
@@ -57,3 +56,4 @@ class ProductManifold(Manifold):
 
     def interpolate(self, q, p, u):
         return self.exp(q, float(u) * self.log(q, p))
+
