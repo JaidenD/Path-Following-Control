@@ -25,11 +25,10 @@ q_home = np.array([
 
 # Controller
 controller_params = {
-    "path_speed": 0.15,
+    "path_speed": 0.5,
     "eta_velocity_gain": 6.0,
     "xi_position_gain": 20.0,
     "xi_velocity_gain": 10.0,
-    "tau_limit": np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]),
 }
 
 # run: PYTHONPATH=. T_FINAL=10 SHOW_PLOT=1 mjpython Examples/Panda/panda-emika.py
@@ -117,8 +116,8 @@ def gamma(eta):
     theta = 2 * np.pi * eta
     q = q_center.copy()
 
-    q[1] += a1 * np.sin(theta)
-    q[2] += a2 * np.cos(theta)
+    q[0] += a1 * np.sin(theta)
+    q[1] += a2 * np.cos(theta)
     return wrap_angle(q)
 
 def gamma_prime(eta):
@@ -153,11 +152,11 @@ def frame(model, data, eta):
     return p, E
 ########################################
 
-
+# q -> (eta, xi)
 def closest_path_coordinates(model, data, q, eta_guess=None):
     q = wrap_angle(q)
 
-    # objective = M_gamma(s)(q - gamma(s), q - gamma(s))
+    # objective = M_gamma(s)(log_gamma(s)(q), log_gamma(s)(q))
     def objective(s):
         p = gamma(s)
         M = metric_at_base(model, data, p)
@@ -172,12 +171,13 @@ def closest_path_coordinates(model, data, q, eta_guess=None):
 
     # Coordinates in M-orthonormal frame.
     coords = E.T @ M @ xi_full
-    _ = coords[0] # we take eta to be the distance minimizing point so ideally this is ~0
+    error = coords[0] # we take eta to be the distance minimizing point so ideally this is ~0
+    # print("tangential error =", error)
     xi_normal = coords[1:]
 
     return eta, xi_normal
 
-# phi: (eta, xi) -> q
+# phi: (eta, xi) -> q, flat connection
 def phi(model, data, eta, xi_normal):
     p, E = frame(model, data, eta)
     displacement = E[:, 1:] @ xi_normal
@@ -212,7 +212,7 @@ def jacobian_dot_times_ydot(model, data, eta, xi_normal, ydot):
     if np.linalg.norm(ydot) < 1e-12:
         return np.zeros(7)
     eps_time = 1e-4
-
+    # y = [eta, xi]
     eta_plus = eta + eps_time * ydot[0]
     eta_minus = eta - eps_time * ydot[0]
 
@@ -283,12 +283,6 @@ def computed_torque_path_controller(model, data, eta_guess):
     Jdot_ydot = jacobian_dot_times_ydot(model, data, eta, xi, ydot)
     qddot_cmd = J @ yddot_cmd + Jdot_ydot
     tau = inverse_dynamics(model, data, qddot_cmd)
-
-    tau = np.clip(
-        tau,
-        -controller_params["tau_limit"],
-        controller_params["tau_limit"],
-    )
 
     return tau, eta, xi
 
@@ -418,12 +412,7 @@ def main():
 
                 eta_guess = eta
 
-                data.qfrc_applied[:] = 0.0
-                data.qfrc_applied[:7] = tau
-
-                # Gripper actuator; hold neutral.
-                if model.nu >= 8:
-                    data.ctrl[7] = 0.0
+                data.qfrc_applied[:7] = tau # apply tau force
 
                 mujoco.mj_step(model, data)
                 viewer.sync()
