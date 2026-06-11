@@ -13,9 +13,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from Manifolds.joints import Revolute
 from Manifolds.manifold import RiemannianManifold
 from Manifolds.product_manifold import ProductManifold
-from path import CubicSplinePath, coordinate_circle_path
-
-
 
 # Q = S^1 x S^1
 CONFIG_MANIFOLD = ProductManifold(Revolute(), Revolute())

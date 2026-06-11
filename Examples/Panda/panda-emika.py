@@ -5,13 +5,12 @@ import mujoco.viewer
 import time
 from pathlib import Path
 import numpy as np
-from scipy.optimize import minimize_scalar
 
+from Numerics.closest_point import minimize_eta
 from Manifolds.joints import Revolute
 from Manifolds.joints import wrap_angle
 from Manifolds.manifold import RiemannianManifold
 from Manifolds.product_manifold import ProductManifold
-from path import CubicSplinePath, coordinate_circle_path
 
 # run: PYTHONPATH=. T_FINAL=10 SHOW_PLOT=1 mjpython Examples/Panda/panda-emika.py
 # 
@@ -19,14 +18,15 @@ MODEL_PATH = Path.home() / "Desktop" / "Robotics" / "mujoco" / "mujoco_menagerie
 DEFAULT_PLOT_PATH = Path(__file__).with_name("panda_plots.png")
 
 # Dynamics ##############################
-"""
-M(q)q'' + C(q, q')q' + grad P(q) = tau
-"""
+# M(q)q'' + C(q, q')q' + grad P(q) = tau
 
 # M(q)
 def mass_matrix(model, data):
+    # By deafult mujoco stores the inertia in data.qM as a 'sparse matrix',
+    # we want it to be dense for calculations.
     M = np.zeros((model.nv, model.nv))
-    mujoco.mj_fullM(model, M, data.qM)
+    mujoco.mj_fullM(model, M, data.qM) # shape = (9,9)
+    # print("dim(mj_fullM) = ", np.shape(M))
     return M[:7, :7]
 
 # C(q, q')q' + grad P(q)
@@ -72,8 +72,8 @@ def gamma(eta):
     theta = 2 * np.pi * eta
     q = q_center.copy()
 
-    q[0] += a1 * np.sin(theta)
-    q[1] += a2 * np.cos(theta)
+    q[1] += a1 * np.sin(theta)
+    q[2] += a2 * np.cos(theta)
     return wrap_angle(q)
 
 def gamma_prime(eta):
@@ -85,58 +85,12 @@ def gamma_prime(eta):
     return dq
 ########################################
 
-# Metric helpers
+# Metric helpers (these 3 functions should probably be wrapped in a metric class)
 def inner(M, u, v):
     return float(u.T @ M @ v)
 
 def norm(M, u):
     return np.sqrt(max(inner(M, u, u), 0.0))
-
-# Make sure s\in[0,1]
-def normalize_eta(s, closed=True):
-    if closed:
-        return float(s % 1.0)
-    return float(np.clip(s, 0.0, 1.0))
-
-def minimize_eta(objective, eta_guess=None, window=0.1, global_grid=80, candidates=4):
-    """
-    One-dimensional closest-point search over eta.
-
-    If eta_guess is provided, search locally. If not,
-    do a coarse global scan first.
-    """
-    intervals = []
-
-    # If provided with eta_guess then make an interval centered at it and search locally
-    if eta_guess is not None:
-        intervals.append((eta_guess - window, eta_guess + window))
-    else:
-        grid = np.linspace(0.0, 1.0, global_grid, endpoint=False)
-        values = np.array([objective(s) for s in grid])
-
-        # The indicies of the n smallest objective vals 
-        best_indices = np.argsort(values)[:candidates]
-        step = 1.0 / global_grid
-
-        for idx in best_indices:
-            center = grid[idx]
-            intervals.append((center - step, center + step))
-
-    best_eta = None
-    best_value = np.inf
-
-    # search over intervals about the n smallest objective values
-    for a, b in intervals:
-        result = minimize_scalar(
-            lambda s: objective(normalize_eta(s)),
-            bounds=(a, b),
-            method="bounded",
-        )
-        if result.fun < best_value:
-            best_eta = normalize_eta(result.x)
-            best_value = result.fun
-
-    return best_eta
 
 # Evaluates metric at given point
 def metric_at_base(model, data, p):
@@ -157,18 +111,8 @@ def metric_at_base(model, data, p):
 
     return M
 
-def closest_eta(model, data, q, eta_guess=None):
-    q = wrap_angle(q)
-    # objective = M_gamma(s)(q - gamma(s), q - gamma(s))
-    def objective(s):
-        p = gamma(s)
-        M = metric_at_base(model, data, p)
-        xi = flat_log(p, q)
-        return inner(M, xi, xi)
-    return minimize_eta(objective, eta_guess=eta_guess)
-
 # TODO: this should be done with the method outlined in the SO(3) paper
-def tangent_and_normal_frame(model, data, eta):
+def frame(model, data, eta):
     p = gamma(eta)
     M = metric_at_base(model, data, p)
 
@@ -191,8 +135,18 @@ def tangent_and_normal_frame(model, data, eta):
     return p, E
 
 def closest_path_coordinates(model, data, q, eta_guess=None):
-    eta = closest_eta(model, data, q, eta_guess)
-    p, E = tangent_and_normal_frame(model, data, eta)
+    q = wrap_angle(q)
+
+    # objective = M_gamma(s)(q - gamma(s), q - gamma(s))
+    def objective(s):
+        p = gamma(s)
+        M = metric_at_base(model, data, p)
+        xi = flat_log(p, q)
+        return inner(M, xi, xi)
+    
+    eta = minimize_eta(objective, eta_guess=eta_guess)
+    
+    p, E = frame(model, data, eta)
     M = metric_at_base(model, data, p)
     xi_full = flat_log(p, q)
 
@@ -205,7 +159,7 @@ def closest_path_coordinates(model, data, q, eta_guess=None):
 
 # phi: (eta, xi) -> q
 def phi(model, data, eta, xi_normal):
-    p, E = tangent_and_normal_frame(model, data, eta)
+    p, E = frame(model, data, eta)
     displacement = E[:, 1:] @ xi_normal
 
     return flat_exp(p, displacement)
@@ -338,14 +292,7 @@ def computed_torque_path_controller(model, data, eta_guess):
 
     return tau, eta, xi
 
-def env_flag(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return bool(default)
-    return value.lower() in ("1", "true", "yes", "on")
-
-
-def plot_eta_xi(history, show=True, save_path=None):
+def plot_eta_xi(history, save_path=None):
     import matplotlib
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
@@ -391,8 +338,8 @@ def plot_eta_xi(history, show=True, save_path=None):
     fig.savefig(save_path, dpi=150)
     print(f"Saved eta/xi plot to {save_path}")
 
-    if show:
-        subprocess.run(["open", str(save_path)], check=False)
+    
+    subprocess.run(["open", str(save_path)], check=False)
 
     plt.close(fig)
 
@@ -415,7 +362,6 @@ def timing_summary(history):
 def main():
     t_final = os.environ.get("T_FINAL")
     t_final = None if t_final is None else float(t_final)
-    show_plot = env_flag("SHOW_PLOT", True)
     plot_path = os.environ.get("PLOT_PATH")
     plot_path = DEFAULT_PLOT_PATH if plot_path is None else Path(plot_path)
 
@@ -428,9 +374,9 @@ def main():
     model.actuator_biasprm[:7, :] = 0.0
 
     print("Loaded Panda model")
-    print("nq =", model.nq)
-    print("nv =", model.nv)
-    print("nu =", model.nu)
+    print("number of generalize coordinates (nq) =", model.nq)
+    print("numer of degrees of freedom (nv) =", model.nv)
+    print("number of actuators (nq) =", model.nu)
 
     # Initial condition near but not exactly on the path.
     data.qpos[:7] = q_center + np.array([0.1, 0.05, 0.05, 0.0, 0.0, 0.0, 0.0])
@@ -461,7 +407,7 @@ def main():
                     break
 
                 step_start = time.perf_counter()
-
+                print("inertia size = ", np.shape(data.qM))
                 tau, eta, xi = computed_torque_path_controller(
                     model,
                     data,
@@ -502,7 +448,7 @@ def main():
             history[key] = np.array(history[key])
 
         timing_summary(history)
-        plot_eta_xi(history, show=show_plot, save_path=plot_path)
+        plot_eta_xi(history, save_path=plot_path)
     
 if __name__ == "__main__":
 
