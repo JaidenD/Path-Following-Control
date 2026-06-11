@@ -12,6 +12,26 @@ from Manifolds.joints import wrap_angle
 from Manifolds.manifold import RiemannianManifold
 from Manifolds.product_manifold import ProductManifold
 
+# Initial config of 7 joints
+q_home = np.array([
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+])
+
+# Controller
+controller_params = {
+    "path_speed": 0.15,
+    "eta_velocity_gain": 6.0,
+    "xi_position_gain": 20.0,
+    "xi_velocity_gain": 10.0,
+    "tau_limit": np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]),
+}
+
 # run: PYTHONPATH=. T_FINAL=10 SHOW_PLOT=1 mjpython Examples/Panda/panda-emika.py
 # 
 MODEL_PATH = Path.home() / "Desktop" / "Robotics" / "mujoco" / "mujoco_menagerie" / "franka_emika_panda" / "scene.xml"
@@ -29,6 +49,32 @@ def mass_matrix(model, data):
     # print("dim(mj_fullM) = ", np.shape(M))
     return M[:7, :7]
 
+# KE helpers
+def inner(M, u, v):
+    return float(u.T @ M @ v)
+
+def norm(M, u):
+    return np.sqrt(max(inner(M, u, u), 0.0))
+
+# Evaluates metric at given point
+def metric_at_base(model, data, p):
+    q_old = data.qpos.copy()
+    dq_old = data.qvel.copy()
+
+    # TODO: check if this is correct. Shouldnt M(q, q') = M(q, 0)?
+    data.qpos[:7] = p
+    data.qvel[:7] = 0.0
+    mujoco.mj_forward(model, data)
+
+    M = mass_matrix(model, data)
+
+    data.qpos[:] = q_old
+    data.qvel[:] = dq_old
+
+    mujoco.mj_forward(model, data)
+
+    return M
+
 # C(q, q')q' + grad P(q)
 def drift_forces(data):
     return data.qfrc_bias[:7].copy()
@@ -45,8 +91,7 @@ config = ProductManifold(Revolute(), Revolute(),
                                   Revolute(), Revolute(), 
                                   Revolute())
 
-# TODO: make the mujoco mass matrix compatible with my metric object and then remove these.
-# TODO: it pro
+# TODO: make these work with the exp and log functions in the ProductManifold class
 def flat_log(p, q):
     return wrap_angle(q - p)
 def flat_exp(p, v):
@@ -83,33 +128,6 @@ def gamma_prime(eta):
     dq[0] += a1 * 2.0 * np.pi * np.cos(theta)
     dq[1] += -a2 * 2.0 * np.pi * np.sin(theta)
     return dq
-########################################
-
-# Metric helpers (these 3 functions should probably be wrapped in a metric class)
-def inner(M, u, v):
-    return float(u.T @ M @ v)
-
-def norm(M, u):
-    return np.sqrt(max(inner(M, u, u), 0.0))
-
-# Evaluates metric at given point
-def metric_at_base(model, data, p):
-    q_old = data.qpos.copy()
-    dq_old = data.qvel.copy()
-
-    # TODO: check if this is correct. Shouldnt M(q, q') = M(q, 0)?
-    data.qpos[:7] = p
-    data.qvel[:7] = 0.0
-    mujoco.mj_forward(model, data)
-
-    M = mass_matrix(model, data)
-
-    data.qpos[:] = q_old
-    data.qvel[:] = dq_old
-
-    mujoco.mj_forward(model, data)
-
-    return M
 
 # TODO: this should be done with the method outlined in the SO(3) paper
 def frame(model, data, eta):
@@ -133,6 +151,8 @@ def frame(model, data, eta):
             break
     E = np.column_stack(basis)
     return p, E
+########################################
+
 
 def closest_path_coordinates(model, data, q, eta_guess=None):
     q = wrap_angle(q)
@@ -145,17 +165,17 @@ def closest_path_coordinates(model, data, q, eta_guess=None):
         return inner(M, xi, xi)
     
     eta = minimize_eta(objective, eta_guess=eta_guess)
-    
+
     p, E = frame(model, data, eta)
     M = metric_at_base(model, data, p)
     xi_full = flat_log(p, q)
 
     # Coordinates in M-orthonormal frame.
     coords = E.T @ M @ xi_full
-    eta_error_coord = coords[0]
+    _ = coords[0] # we take eta to be the distance minimizing point so ideally this is ~0
     xi_normal = coords[1:]
 
-    return eta, p, M, E, eta_error_coord, xi_normal
+    return eta, xi_normal
 
 # phi: (eta, xi) -> q
 def phi(model, data, eta, xi_normal):
@@ -206,26 +226,6 @@ def jacobian_dot_times_ydot(model, data, eta, xi_normal, ydot):
 
     return Jdot @ ydot
 
-# Initial config of 7 joints
-q_home = np.array([
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-])
-
-# Controller
-controller_params = {
-    "path_speed": 0.15,
-    "eta_velocity_gain": 6.0,
-    "xi_position_gain": 20.0,
-    "xi_velocity_gain": 10.0,
-    "tau_limit": np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]),
-}
-
 def desired_eta_rate(model, data, eta):
     M = metric_at_base(model, data, gamma(eta))
     gp = gamma_prime(eta)
@@ -249,7 +249,7 @@ def computed_torque_path_controller(model, data, eta_guess):
     q = wrap_angle(data.qpos[:7].copy())
     dq = data.qvel[:7].copy()
 
-    eta, p, M, E, eta_error_coord, xi = closest_path_coordinates(
+    eta, xi = closest_path_coordinates(
         model,
         data,
         q,
@@ -292,6 +292,7 @@ def computed_torque_path_controller(model, data, eta_guess):
 
     return tau, eta, xi
 
+# Logging 
 def plot_eta_xi(history, save_path=None):
     import matplotlib
     matplotlib.use("Agg", force=True)
@@ -343,7 +344,6 @@ def plot_eta_xi(history, save_path=None):
 
     plt.close(fig)
 
-
 def timing_summary(history):
     step_time = np.array(history["step_time"])
 
@@ -357,6 +357,9 @@ def timing_summary(history):
     print(f"  mean step:   {np.mean(step_time):.6f} s")
     print(f"  median step: {np.median(step_time):.6f} s")
     print(f"  max step:    {np.max(step_time):.6f} s")
+####################
+
+
 
 # Main MuJoCo sim
 def main():
@@ -365,11 +368,11 @@ def main():
     plot_path = os.environ.get("PLOT_PATH")
     plot_path = DEFAULT_PLOT_PATH if plot_path is None else Path(plot_path)
 
+    # Load model
     model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
     data = mujoco.MjData(model)
 
-    # The menagerie Panda arm actuators are position servos. This controller
-    # computes generalized torques, so apply those through qfrc_applied instead.
+    # The chosen model has built in joint pd control, to supply my own torques set the joint PD gains to zero.
     model.actuator_gainprm[:7, :] = 0.0
     model.actuator_biasprm[:7, :] = 0.0
 
@@ -378,7 +381,7 @@ def main():
     print("numer of degrees of freedom (nv) =", model.nv)
     print("number of actuators (nq) =", model.nu)
 
-    # Initial condition near but not exactly on the path.
+    # Initial conditions
     data.qpos[:7] = q_center + np.array([0.1, 0.05, 0.05, 0.0, 0.0, 0.0, 0.0])
     data.qvel[:7] = 0.0
 
@@ -407,7 +410,6 @@ def main():
                     break
 
                 step_start = time.perf_counter()
-                print("inertia size = ", np.shape(data.qM))
                 tau, eta, xi = computed_torque_path_controller(
                     model,
                     data,
@@ -436,10 +438,6 @@ def main():
                 history["qdot"].append(data.qvel[:7].copy())
                 history["step_time"].append(step_time)
 
-                # Optional: slow to real time-ish
-                sleep_time = model.opt.timestep - step_time
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
     except KeyboardInterrupt:
         print("\nInterrupted; plotting recorded eta/xi history.")
     finally:
